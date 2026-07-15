@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from m3u_player.caster import CastManager
+from m3u_player.hls import to_hls_url
 from m3u_player.playlist import Channel, parse_m3u
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
@@ -101,6 +103,24 @@ class LoaderThread(QThread):
             channels = parse_m3u(text)
             self.loaded.emit(channels)
         except Exception as exc:  # surfaced to the UI thread
+            self.failed.emit(str(exc))
+
+
+class CastWorker(QThread):
+    """Runs a blocking cast/stop call off the UI thread."""
+
+    ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn()
+            self.ok.emit(result or "")
+        except Exception as exc:
             self.failed.emit(str(exc))
 
 
@@ -184,6 +204,8 @@ class MainWindow(QMainWindow):
         self.current_group: str | None = None
         self._loader: LoaderThread | None = None
         self._is_fullscreen = False
+        self.cast_manager = CastManager()
+        self._cast_workers: list[CastWorker] = []
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -417,25 +439,106 @@ class MainWindow(QMainWindow):
         else:
             super().keyPressEvent(event)
 
-    # ---- favorites ----------------------------------------------------- #
+    # ---- context menu: favorites + cast -------------------------------- #
     def _on_channel_menu(self, pos) -> None:
         index = self.channel_view.indexAt(pos)
         channel = self.channel_model.channel_at(index)
         if channel is None:
             return
         menu = QMenu(self)
-        if self.config.is_favorite(channel):
-            action = menu.addAction("Remove from favorites")
+        fav_action = menu.addAction(
+            "Remove from favorites"
+            if self.config.is_favorite(channel)
+            else "Add to favorites"
+        )
+
+        cast_menu = menu.addMenu("Cast")
+        device_actions = {}
+        devices = self.cast_manager.list_devices()
+        if devices:
+            for uuid_str, name in devices:
+                device_actions[cast_menu.addAction(name)] = uuid_str
         else:
-            action = menu.addAction("Add to favorites")
+            searching = cast_menu.addAction("Searching…")
+            searching.setEnabled(False)
+        cast_menu.addSeparator()
+        rescan_action = cast_menu.addAction("Rescan")
+        stop_cast_action = (
+            menu.addAction("Stop casting") if self.cast_manager.is_active() else None
+        )
+
         chosen = menu.exec(self.channel_view.viewport().mapToGlobal(pos))
-        if chosen == action:
+        if chosen is None:
+            return
+        if chosen == fav_action:
             self.config.toggle_favorite(channel)
             self.config.save()
             if self.current_group == FAVORITES_LABEL:
                 self._show_current_group()
             else:
                 self.channel_model.refresh()
+        elif chosen in device_actions:
+            self._start_cast(channel, device_actions[chosen])
+        elif chosen == rescan_action:
+            self.cast_manager.rescan()
+            self.statusBar().showMessage("Rescanning for cast devices…")
+        elif stop_cast_action is not None and chosen == stop_cast_action:
+            self._stop_cast()
+
+    # ---- casting ------------------------------------------------------- #
+    def _run_cast_worker(self, fn, on_ok, on_failed) -> None:
+        worker = CastWorker(fn)
+        worker.ok.connect(on_ok)
+        worker.failed.connect(on_failed)
+        worker.finished.connect(lambda w=worker: self._cast_workers.remove(w))
+        self._cast_workers.append(worker)
+        worker.start()
+
+    def _start_cast(self, channel: Channel, uuid_str: str) -> None:
+        if self.player:
+            self.player.stop()
+        url = to_hls_url(channel.url)
+        self.now_playing.setText(f"📺 Casting '{channel.name}'…")
+        self.statusBar().showMessage("Connecting to cast device…")
+        self.config.last_watched = {
+            "group": channel.group,
+            "name": channel.name,
+            "stream_id": channel.stream_id,
+        }
+        self.config.save()
+        self._run_cast_worker(
+            lambda: self.cast_manager.cast(uuid_str, url, channel.name),
+            lambda device: self._on_cast_ok(channel, device),
+            self._on_cast_failed,
+        )
+
+    def _on_cast_ok(self, channel: Channel, device: str) -> None:
+        self.now_playing.setText(f"📺 Casting '{channel.name}' to {device}")
+        self.statusBar().showMessage(f"Casting to {device}")
+
+    def _on_cast_failed(self, message: str) -> None:
+        self.now_playing.setText("Nothing playing")
+        self.statusBar().showMessage("Couldn't cast to device")
+        QMessageBox.warning(self, "Cast failed", message)
+
+    def _stop_cast(self) -> None:
+        self.statusBar().showMessage("Stopping cast…")
+        self._run_cast_worker(
+            lambda: (self.cast_manager.stop(), "")[1],
+            lambda _: self._on_cast_stopped(),
+            lambda _: self._on_cast_stopped(),
+        )
+
+    def _on_cast_stopped(self) -> None:
+        self.now_playing.setText("Nothing playing")
+        self.statusBar().showMessage("Cast stopped")
+
+    def closeEvent(self, event) -> None:
+        try:
+            self.cast_manager.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ---- open / refresh ------------------------------------------------ #
     def _open_dialog(self) -> None:
@@ -465,6 +568,7 @@ def main() -> None:
     window = MainWindow(config)
     window.show()
     window.bind_player(Player())
+    window.cast_manager.start_discovery()
 
     if config.source:
         window.start_load(config.source)
