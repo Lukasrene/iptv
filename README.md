@@ -23,18 +23,20 @@ Just run it — the script sets up its environment automatically on first launch
 ./run.sh
 ```
 
-The first run creates a Python virtualenv (`.venv`) and installs the
-dependencies; later runs skip straight to launching.
+The first run creates a Python virtualenv and installs the dependencies; later
+runs skip straight to launching.
 
-> **Keep this project on local disk, not iCloud Drive.** iCloud evicts binary
-> files (like the Qt and VLC libraries) to the cloud to save space, which breaks
-> the app with cryptic library-loading errors.
+> **Where the virtualenv lives:** this repo may sit in an iCloud-synced folder,
+> and iCloud evicts binary files (like the Qt and VLC libraries) to the cloud,
+> which breaks the app with cryptic library-loading errors. So the environment is
+> created on **local disk** at `~/Library/Application Support/M3UPlayer/venv`,
+> never inside the synced repo. `run.sh` handles this automatically.
 
 To set it up manually instead:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
+~/"Library/Application Support/M3UPlayer/venv/bin/pip" install -r requirements.txt
 ```
 
 ## Using it
@@ -87,7 +89,7 @@ stored in:
 ## Tests
 
 ```bash
-.venv/bin/pytest
+~/"Library/Application Support/M3UPlayer/venv/bin/pytest"
 ```
 
 ## Not in this version (possible later)
