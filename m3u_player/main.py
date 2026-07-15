@@ -32,13 +32,39 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import subprocess
+
 from m3u_player.caster import CastManager
 from m3u_player.hls import to_hls_url
 from m3u_player.playlist import Channel, parse_m3u
+from m3u_player.proxy import HlsProxy
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
 
 FAVORITES_LABEL = "★ Favorites"
+
+
+class KeepAwake:
+    """Prevents the Mac from sleeping while active (via `caffeinate`), so the
+    local cast relay keeps running. No-op off macOS."""
+
+    def __init__(self):
+        self._proc = None
+
+    def on(self) -> None:
+        if self._proc is None and sys.platform == "darwin":
+            try:
+                self._proc = subprocess.Popen(["caffeinate", "-i", "-m", "-s"])
+            except Exception:
+                self._proc = None
+
+    def off(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
 
 
 def cache_path() -> Path:
@@ -205,6 +231,8 @@ class MainWindow(QMainWindow):
         self._loader: LoaderThread | None = None
         self._is_fullscreen = False
         self.cast_manager = CastManager()
+        self.proxy = HlsProxy()
+        self._keep_awake = KeepAwake()
         self._cast_workers: list[CastWorker] = []
 
         self.setWindowTitle("M3U Player")
@@ -497,7 +525,17 @@ class MainWindow(QMainWindow):
     def _start_cast(self, channel: Channel, uuid_str: str) -> None:
         if self.player:
             self.player.stop()
-        url = to_hls_url(channel.url)
+        # Route the stream through the local relay (the provider's redirect +
+        # session-hashed segments can't be played by the Chromecast directly),
+        # and keep the Mac awake so the relay stays alive while casting.
+        self.proxy.set_source(to_hls_url(channel.url))
+        try:
+            self.proxy.start()
+        except Exception as exc:
+            self._on_cast_failed(f"Couldn't start local relay: {exc}")
+            return
+        local_url = self.proxy.manifest_url()
+        self._keep_awake.on()
         self.now_playing.setText(f"📺 Casting '{channel.name}'…")
         self.statusBar().showMessage("Connecting to cast device…")
         self.config.last_watched = {
@@ -507,7 +545,7 @@ class MainWindow(QMainWindow):
         }
         self.config.save()
         self._run_cast_worker(
-            lambda: self.cast_manager.cast(uuid_str, url, channel.name),
+            lambda: self.cast_manager.cast(uuid_str, local_url, channel.name),
             lambda device: self._on_cast_ok(channel, device),
             self._on_cast_failed,
         )
@@ -517,6 +555,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Casting to {device}")
 
     def _on_cast_failed(self, message: str) -> None:
+        self._keep_awake.off()
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Couldn't cast to device")
         QMessageBox.warning(self, "Cast failed", message)
@@ -530,14 +569,17 @@ class MainWindow(QMainWindow):
         )
 
     def _on_cast_stopped(self) -> None:
+        self._keep_awake.off()
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Cast stopped")
 
     def closeEvent(self, event) -> None:
-        try:
-            self.cast_manager.shutdown()
-        except Exception:
-            pass
+        self._keep_awake.off()
+        for closer in (self.proxy.stop, self.cast_manager.shutdown):
+            try:
+                closer()
+            except Exception:
+                pass
         super().closeEvent(event)
 
     # ---- open / refresh ------------------------------------------------ #

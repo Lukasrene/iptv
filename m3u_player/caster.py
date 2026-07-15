@@ -72,7 +72,18 @@ class CastManager:
         cast = pychromecast.get_chromecast_from_cast_info(info, self._zconf)
         cast.wait(timeout=10)
         mc = cast.media_controller
-        mc.play_media(url, content_type=_HLS_CONTENT_TYPE, title=title, stream_type="LIVE")
+        # Tell the receiver the HLS segments are MPEG-2 TS so its player demuxes
+        # them correctly (the default receiver otherwise mishandles TS HLS).
+        mc.play_media(
+            url,
+            content_type=_HLS_CONTENT_TYPE,
+            title=title,
+            stream_type="LIVE",
+            media_info={
+                "hlsVideoSegmentFormat": "mpeg2_ts",
+                "hlsSegmentFormat": "mpeg2_ts",
+            },
+        )
         mc.block_until_active(timeout=10)
         self._active = cast
         return info.friendly_name or "TV"
