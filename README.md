@@ -50,8 +50,19 @@ python3 -m venv .venv
 - **Right pane** — the video, with Play/Pause, Stop, a volume slider, and a
   fullscreen button (or double-click the video).
 - **Favorites** — right-click a channel to add/remove it.
+- **Cast to TV** — right-click a channel → **Cast** → pick a device. Playback
+  **moves to the TV** (the Mac stops playing and the TV streams it directly). Use
+  **Cast → Stop casting** to stop, or **Rescan** if your device isn't listed yet.
 - **Refresh** (toolbar) re-fetches a URL playlist to pick up new channels and
   refreshed access tokens.
+
+### Casting notes
+
+- Works with Google Cast devices (Chromecast, Google TV, Android TV boxes with
+  Chromecast built-in) on the same network as your Mac.
+- The app casts the channel's **HLS** stream (`…/live/…/<id>.m3u8`). HD channels
+  (H.264) cast to any device; UHD channels (HEVC) need an HEVC-capable device
+  such as a 4K Chromecast with Google TV.
 
 ### Why URL support matters
 
