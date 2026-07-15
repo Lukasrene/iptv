@@ -183,6 +183,7 @@ class MainWindow(QMainWindow):
         self.group_map: dict[str, list[Channel]] = {}
         self.current_group: str | None = None
         self._loader: LoaderThread | None = None
+        self._is_fullscreen = False
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -230,7 +231,9 @@ class MainWindow(QMainWindow):
         self.video_frame.doubleClicked.connect(self._toggle_fullscreen)
         rlayout.addWidget(self.video_frame, 1)
 
-        controls = QHBoxLayout()
+        self.controls_widget = QWidget()
+        controls = QHBoxLayout(self.controls_widget)
+        controls.setContentsMargins(0, 0, 0, 0)
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._on_play_clicked)
         stop_btn = QPushButton("Stop")
@@ -246,12 +249,15 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("🔊"))
         controls.addWidget(self.volume, 1)
         controls.addWidget(fs_btn)
-        rlayout.addLayout(controls)
+        rlayout.addWidget(self.controls_widget)
         splitter.addWidget(right)
 
         splitter.setSizes([220, 320, 560])
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("Ready")
+
+        # widgets hidden when the video goes fullscreen
+        self._chrome = [self.group_list, middle, self.now_playing, self.controls_widget]
 
         # search debounce
         self._search_timer = QTimer(self)
@@ -261,6 +267,7 @@ class MainWindow(QMainWindow):
 
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
+        self._toolbar = tb
         open_action = QAction("Open…", self)
         open_action.triggered.connect(self._open_dialog)
         tb.addAction(open_action)
@@ -386,8 +393,29 @@ class MainWindow(QMainWindow):
             self.player.set_volume(value)
 
     def _toggle_fullscreen(self) -> None:
-        if self.player:
-            self.player.toggle_fullscreen()
+        # VLC's own fullscreen is a no-op for an embedded surface on macOS, so we
+        # do it at the window level: hide all chrome and let the video fill the
+        # screen. The video surface is never reparented, so VLC's binding holds.
+        if not self._is_fullscreen:
+            for w in self._chrome:
+                w.hide()
+            self._toolbar.hide()
+            self.statusBar().hide()
+            self.showFullScreen()
+            self._is_fullscreen = True
+        else:
+            for w in self._chrome:
+                w.show()
+            self._toolbar.show()
+            self.statusBar().show()
+            self.showNormal()
+            self._is_fullscreen = False
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape and self._is_fullscreen:
+            self._toggle_fullscreen()
+        else:
+            super().keyPressEvent(event)
 
     # ---- favorites ----------------------------------------------------- #
     def _on_channel_menu(self, pos) -> None:

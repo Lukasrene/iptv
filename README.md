@@ -15,21 +15,31 @@ playlist of MPEG-TS live streams).
   played by a browser or QuickTime.)
 - Python 3.9+
 
-## Setup
+## Setup & Run
 
-```bash
-cd m3u-player
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-## Run
+Just run it — the script sets up its environment automatically on first launch:
 
 ```bash
 ./run.sh
 ```
 
-(or `.venv/bin/python -m m3u_player.main`)
+The first run creates a Python virtualenv and installs the dependencies; later
+runs skip straight to launching.
+
+> **Why the environment is stored outside this folder:** this project lives in
+> iCloud Drive, which evicts binary files to the cloud to save space. That
+> breaks Qt/VLC library loading with cryptic errors. So `run.sh` puts the
+> virtualenv on local disk at
+> `~/Library/Application Support/M3UPlayer/venv` instead of inside the
+> (synced) project folder. The code stays in iCloud; only the heavy binaries
+> live locally.
+
+To set it up manually instead:
+
+```bash
+python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
+~/"Library/Application Support/M3UPlayer/venv/bin/pip" install -r requirements.txt
+```
 
 ## Using it
 
@@ -70,7 +80,7 @@ stored in:
 ## Tests
 
 ```bash
-.venv/bin/pytest
+~/"Library/Application Support/M3UPlayer/venv/bin/pytest"
 ```
 
 ## Not in this version (possible later)

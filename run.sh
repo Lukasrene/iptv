@@ -2,9 +2,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The virtualenv lives on LOCAL disk (not iCloud). iCloud Drive evicts binary
+# files to the cloud, which intermittently breaks Qt/VLC library loading. Keep
+# the heavy dependencies off the synced folder.
+VENV="$HOME/Library/Application Support/M3UPlayer/venv"
+
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "Setting up the environment (first run)…"
+  mkdir -p "$HOME/Library/Application Support/M3UPlayer"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --upgrade pip
+  "$VENV/bin/pip" install -r requirements.txt
+fi
+
 # python-vlc normally finds VLC.app on its own. If it can't, uncomment these to
 # point it at the installed engine explicitly:
 # export DYLD_LIBRARY_PATH="/Applications/VLC.app/Contents/MacOS/lib:${DYLD_LIBRARY_PATH:-}"
 # export PYTHON_VLC_LIB_PATH="/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib"
 
-exec .venv/bin/python -m m3u_player.main
+exec "$VENV/bin/python" -m m3u_player.main
