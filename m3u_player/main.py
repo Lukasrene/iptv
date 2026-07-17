@@ -33,11 +33,13 @@ from PySide6.QtWidgets import (
 )
 
 import subprocess
+from uuid import uuid4
 
 from m3u_player.caster import CastManager
 from m3u_player.hls import to_hls_url
 from m3u_player.playlist import Channel, parse_m3u
 from m3u_player.proxy import HlsProxy
+from m3u_player.recorder import Recorder
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
 
@@ -234,6 +236,9 @@ class MainWindow(QMainWindow):
         self.proxy = HlsProxy()
         self._keep_awake = KeepAwake()
         self._cast_workers: list[CastWorker] = []
+        self._recorder: Recorder | None = None
+        self._active_channel: Channel | None = None
+        self._is_casting = False
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -416,15 +421,45 @@ class MainWindow(QMainWindow):
     def _on_play_clicked(self) -> None:
         self._play(self._selected_channel())
 
+    # ---- DVR stream lifecycle (recorder + relay feed both local and cast) --- #
+    def _ensure_stream(self, channel: Channel) -> str:
+        """Start (or reuse) the DVR recorder+relay for this channel and return the
+        local seekable manifest URL that both VLC and the Chromecast play."""
+        if (
+            self._recorder is not None
+            and self._active_channel is not None
+            and self._active_channel.url == channel.url
+        ):
+            return self.proxy.manifest_url()
+        self._teardown_stream()
+        dvr_dir = default_config_path().parent / "dvr" / uuid4().hex
+        self._recorder = Recorder(to_hls_url(channel.url), dvr_dir)
+        self._recorder.start()
+        self.proxy.attach_recorder(self._recorder)
+        self.proxy.start()
+        self._active_channel = channel
+        return self.proxy.manifest_url()
+
+    def _teardown_stream(self) -> None:
+        if self._recorder is not None:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+            self._recorder = None
+        self._active_channel = None
+
     def _play(self, channel: Channel | None) -> None:
         if channel is None or self.player is None:
             return
         try:
-            self.player.play(channel.url)
+            url = self._ensure_stream(channel)
+            self.player.play(url)
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
             return
+        self._is_casting = False
         self.now_playing.setText(channel.name)
         self.config.last_watched = {
             "group": channel.group,
@@ -436,6 +471,8 @@ class MainWindow(QMainWindow):
     def _on_stop_clicked(self) -> None:
         if self.player:
             self.player.stop()
+        self._teardown_stream()
+        self._is_casting = False
         self.now_playing.setText("Nothing playing")
 
     def _on_volume(self, value: int) -> None:
@@ -525,16 +562,15 @@ class MainWindow(QMainWindow):
     def _start_cast(self, channel: Channel, uuid_str: str) -> None:
         if self.player:
             self.player.stop()
-        # Route the stream through the local relay (the provider's redirect +
+        # Route through the local DVR relay (the provider's redirect +
         # session-hashed segments can't be played by the Chromecast directly),
         # and keep the Mac awake so the relay stays alive while casting.
-        self.proxy.set_source(to_hls_url(channel.url))
         try:
-            self.proxy.start()
+            local_url = self._ensure_stream(channel)
         except Exception as exc:
             self._on_cast_failed(f"Couldn't start local relay: {exc}")
             return
-        local_url = self.proxy.manifest_url()
+        self._is_casting = True
         self._keep_awake.on()
         self.now_playing.setText(f"📺 Casting '{channel.name}'…")
         self.statusBar().showMessage("Connecting to cast device…")
@@ -556,6 +592,7 @@ class MainWindow(QMainWindow):
 
     def _on_cast_failed(self, message: str) -> None:
         self._keep_awake.off()
+        self._is_casting = False
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Couldn't cast to device")
         QMessageBox.warning(self, "Cast failed", message)
@@ -570,12 +607,14 @@ class MainWindow(QMainWindow):
 
     def _on_cast_stopped(self) -> None:
         self._keep_awake.off()
+        self._is_casting = False
+        self._teardown_stream()
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Cast stopped")
 
     def closeEvent(self, event) -> None:
         self._keep_awake.off()
-        for closer in (self.proxy.stop, self.cast_manager.shutdown):
+        for closer in (self._teardown_stream, self.proxy.stop, self.cast_manager.shutdown):
             try:
                 closer()
             except Exception:
