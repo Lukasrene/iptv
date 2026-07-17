@@ -46,3 +46,16 @@ class Player:
 
     def toggle_fullscreen(self) -> None:
         self._mp.toggle_fullscreen()
+
+    # ---- DVR position / seek (times in seconds) ---- #
+    def time_s(self) -> float:
+        return max(0.0, self._mp.get_time() / 1000.0)
+
+    def length_s(self) -> float:
+        return max(0.0, self._mp.get_length() / 1000.0)
+
+    def seek_s(self, t: float) -> None:
+        self._mp.set_time(int(max(0.0, t) * 1000))
+
+    def is_paused(self) -> bool:
+        return str(self._mp.get_state()) == "State.Paused"

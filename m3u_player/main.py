@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +43,7 @@ from m3u_player.proxy import HlsProxy
 from m3u_player.recorder import Recorder
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
+from m3u_player.transport import clamp_seek, hover_label
 
 FAVORITES_LABEL = "★ Favorites"
 
@@ -219,6 +221,41 @@ class VideoFrame(QWidget):
         self.doubleClicked.emit()
 
 
+class Timeline(QSlider):
+    """DVR scrubber. Range is 0..1000 (a fraction of the buffered window). Emits
+    ``seekRequested(fraction)`` on click/drag, and shows an on-hover tooltip of
+    how far behind live the hovered point is."""
+
+    seekRequested = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.setRange(0, 1000)
+        self.setMouseTracking(True)
+        self.setEnabled(False)
+        self._label_fn = None  # callable(fraction)->str
+        self.sliderReleased.connect(lambda: self.seekRequested.emit(self.value() / 1000.0))
+
+    def set_label_fn(self, fn) -> None:
+        self._label_fn = fn
+
+    def _fraction_at(self, x: float) -> float:
+        w = max(1, self.width())
+        return min(1.0, max(0.0, x / w))
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._label_fn is not None:
+            frac = self._fraction_at(event.position().x())
+            QToolTip.showText(event.globalPosition().toPoint(), self._label_fn(frac), self)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        frac = self._fraction_at(event.position().x())
+        self.setValue(int(frac * 1000))
+        self.seekRequested.emit(frac)
+        super().mousePressEvent(event)
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -286,9 +323,31 @@ class MainWindow(QMainWindow):
         self.video_frame.doubleClicked.connect(self._toggle_fullscreen)
         rlayout.addWidget(self.video_frame, 1)
 
+        # DVR timeline row
+        self.timeline_widget = QWidget()
+        tlayout = QHBoxLayout(self.timeline_widget)
+        tlayout.setContentsMargins(0, 0, 0, 0)
+        self.timeline = Timeline()
+        self.timeline.set_label_fn(self._timeline_hover_label)
+        self.timeline.seekRequested.connect(self._on_timeline_seek)
+        self.behind_live_label = QLabel("")
+        self.behind_live_label.setMinimumWidth(120)
+        self.behind_live_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        tlayout.addWidget(self.timeline, 1)
+        tlayout.addWidget(self.behind_live_label)
+        rlayout.addWidget(self.timeline_widget)
+
         self.controls_widget = QWidget()
         controls = QHBoxLayout(self.controls_widget)
         controls.setContentsMargins(0, 0, 0, 0)
+        live_btn = QPushButton("⏮ Live")
+        live_btn.clicked.connect(self._seek_live)
+        back10_btn = QPushButton("−10s")
+        back10_btn.clicked.connect(lambda: self._seek_relative(-10))
+        self.pause_btn = QPushButton("⏸")
+        self.pause_btn.clicked.connect(self._pause_toggle)
+        fwd10_btn = QPushButton("+10s")
+        fwd10_btn.clicked.connect(lambda: self._seek_relative(10))
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._on_play_clicked)
         stop_btn = QPushButton("Stop")
@@ -298,11 +357,13 @@ class MainWindow(QMainWindow):
         self.volume = QSlider(Qt.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
+        self.volume.setMaximumWidth(120)
         self.volume.valueChanged.connect(self._on_volume)
-        controls.addWidget(self.play_btn)
-        controls.addWidget(stop_btn)
+        for w in (live_btn, back10_btn, self.pause_btn, fwd10_btn, self.play_btn, stop_btn):
+            controls.addWidget(w)
+        controls.addStretch(1)
         controls.addWidget(QLabel("🔊"))
-        controls.addWidget(self.volume, 1)
+        controls.addWidget(self.volume)
         controls.addWidget(fs_btn)
         rlayout.addWidget(self.controls_widget)
         splitter.addWidget(right)
@@ -312,13 +373,26 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         # widgets hidden when the video goes fullscreen
-        self._chrome = [self.group_list, middle, self.now_playing, self.controls_widget]
+        self._chrome = [
+            self.group_list,
+            middle,
+            self.now_playing,
+            self.timeline_widget,
+            self.controls_widget,
+        ]
 
         # search debounce
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._apply_search)
+
+        # DVR position polling (updates the timeline from the active target)
+        self._pos_timer = QTimer(self)
+        self._pos_timer.setInterval(1000)
+        self._pos_timer.timeout.connect(self._update_timeline)
+        self._pos_timer.start()
+        self._window_seconds = 0.0  # current buffered window length
 
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
@@ -478,6 +552,68 @@ class MainWindow(QMainWindow):
     def _on_volume(self, value: int) -> None:
         if self.player:
             self.player.set_volume(value)
+
+    # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
+    def _target_position_length(self) -> tuple[float, float]:
+        window = 0.0
+        if self._recorder is not None:
+            window = sum(s.duration for s in self._recorder.snapshot())
+        if self._is_casting and self.cast_manager.is_active():
+            pos = self.cast_manager.current_time() or 0.0
+        elif self.player is not None:
+            pos = self.player.time_s()
+        else:
+            pos = 0.0
+        return pos, window
+
+    def _seek_to(self, t: float) -> None:
+        _, window = self._target_position_length()
+        t = clamp_seek(t, 0.0, max(0.0, window))
+        if self._is_casting and self.cast_manager.is_active():
+            self.cast_manager.seek(t)
+        elif self.player is not None:
+            self.player.seek_s(t)
+
+    def _seek_relative(self, delta: float) -> None:
+        pos, _ = self._target_position_length()
+        self._seek_to(pos + delta)
+
+    def _seek_live(self) -> None:
+        _, window = self._target_position_length()
+        self._seek_to(max(0.0, window - 2.0))
+
+    def _pause_toggle(self) -> None:
+        if self._is_casting and self.cast_manager.is_active():
+            if self.cast_manager.is_paused():
+                self.cast_manager.resume()
+            else:
+                self.cast_manager.pause()
+        elif self.player is not None:
+            self.player.pause()
+
+    def _timeline_hover_label(self, fraction: float) -> str:
+        return hover_label(fraction * self._window_seconds, self._window_seconds)
+
+    def _on_timeline_seek(self, fraction: float) -> None:
+        self._seek_to(fraction * self._window_seconds)
+
+    def _update_timeline(self) -> None:
+        active = self._recorder is not None
+        self.timeline.setEnabled(active)
+        if not active:
+            self.behind_live_label.setText("")
+            return
+        pos, window = self._target_position_length()
+        self._window_seconds = window
+        if window > 0 and not self.timeline.isSliderDown():
+            self.timeline.setValue(int(min(1.0, pos / window) * 1000))
+        self.behind_live_label.setText(hover_label(pos, window) if window > 0 else "buffering…")
+        paused = (
+            self.cast_manager.is_paused()
+            if (self._is_casting and self.cast_manager.is_active())
+            else (self.player.is_paused() if self.player else False)
+        )
+        self.pause_btn.setText("▶" if paused else "⏸")
 
     def _toggle_fullscreen(self) -> None:
         # VLC's own fullscreen is a no-op for an embedded surface on macOS, so we
