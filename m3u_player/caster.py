@@ -91,6 +91,44 @@ class CastManager:
     def is_active(self) -> bool:
         return self._active is not None
 
+    # ---- DVR transport on the casting device (times in seconds) ---- #
+    def current_time(self) -> float | None:
+        if self._active is None:
+            return None
+        try:
+            return self._active.media_controller.status.current_time
+        except Exception:
+            return None
+
+    def seek(self, t: float) -> None:
+        if self._active is not None:
+            try:
+                self._active.media_controller.seek(max(0.0, t))
+            except Exception:
+                pass
+
+    def pause(self) -> None:
+        if self._active is not None:
+            try:
+                self._active.media_controller.pause()
+            except Exception:
+                pass
+
+    def resume(self) -> None:
+        if self._active is not None:
+            try:
+                self._active.media_controller.play()
+            except Exception:
+                pass
+
+    def is_paused(self) -> bool:
+        if self._active is None:
+            return False
+        try:
+            return str(self._active.media_controller.status.player_state) == "PAUSED"
+        except Exception:
+            return False
+
     def stop(self) -> None:
         """Stop playback on the TV and disconnect. Blocking — run off UI thread."""
         cast = self._active

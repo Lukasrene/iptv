@@ -55,6 +55,11 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
 - **Cast to TV** — right-click a channel → **Cast** → pick a device. Playback
   **moves to the TV** (the Mac stops playing and the TV streams it directly). Use
   **Cast → Stop casting** to stop, or **Rescan** if your device isn't listed yet.
+- **Pause / rewind (DVR)** — from the moment you start a channel, the app records
+  a rolling **1-hour** buffer. Use the timeline to scrub back (hover shows how far
+  behind live a click lands), **−10s / +10s** to step, **⏸** to pause, and
+  **⏮ Live** to jump back to the live edge. Nothing recorded is lost while you
+  jump around. **Works while casting too** — the same controls drive the TV.
 - **Refresh** (toolbar) re-fetches a URL playlist to pick up new channels and
   refreshed access tokens.
 
@@ -65,6 +70,15 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
 - The app casts the channel's **HLS** stream (`…/live/…/<id>.m3u8`). HD channels
   (H.264) cast to any device; UHD channels (HEVC) need an HEVC-capable device
   such as a 4K Chromecast with Google TV.
+
+### DVR / disk usage
+
+The rolling 1-hour buffer is written to
+`~/Library/Application Support/M3UPlayer/dvr/` while a channel is active and
+cleared when you switch channels, stop, or quit. A full hour is roughly
+2–3 GB for HD and up to ~10 GB for UHD. Because both local playback and casting
+run through this buffer, live is ~15–30s behind real-time; **⏮ Live** jumps to
+the newest buffered moment.
 
 ### Why URL support matters
 

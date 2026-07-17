@@ -28,18 +28,22 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 import subprocess
+from uuid import uuid4
 
 from m3u_player.caster import CastManager
 from m3u_player.hls import to_hls_url
 from m3u_player.playlist import Channel, parse_m3u
 from m3u_player.proxy import HlsProxy
+from m3u_player.recorder import Recorder
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
+from m3u_player.transport import clamp_seek, hover_label
 
 FAVORITES_LABEL = "★ Favorites"
 
@@ -217,6 +221,41 @@ class VideoFrame(QWidget):
         self.doubleClicked.emit()
 
 
+class Timeline(QSlider):
+    """DVR scrubber. Range is 0..1000 (a fraction of the buffered window). Emits
+    ``seekRequested(fraction)`` on click/drag, and shows an on-hover tooltip of
+    how far behind live the hovered point is."""
+
+    seekRequested = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.setRange(0, 1000)
+        self.setMouseTracking(True)
+        self.setEnabled(False)
+        self._label_fn = None  # callable(fraction)->str
+        self.sliderReleased.connect(lambda: self.seekRequested.emit(self.value() / 1000.0))
+
+    def set_label_fn(self, fn) -> None:
+        self._label_fn = fn
+
+    def _fraction_at(self, x: float) -> float:
+        w = max(1, self.width())
+        return min(1.0, max(0.0, x / w))
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._label_fn is not None:
+            frac = self._fraction_at(event.position().x())
+            QToolTip.showText(event.globalPosition().toPoint(), self._label_fn(frac), self)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        frac = self._fraction_at(event.position().x())
+        self.setValue(int(frac * 1000))
+        self.seekRequested.emit(frac)
+        super().mousePressEvent(event)
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -234,6 +273,9 @@ class MainWindow(QMainWindow):
         self.proxy = HlsProxy()
         self._keep_awake = KeepAwake()
         self._cast_workers: list[CastWorker] = []
+        self._recorder: Recorder | None = None
+        self._active_channel: Channel | None = None
+        self._is_casting = False
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -281,9 +323,31 @@ class MainWindow(QMainWindow):
         self.video_frame.doubleClicked.connect(self._toggle_fullscreen)
         rlayout.addWidget(self.video_frame, 1)
 
+        # DVR timeline row
+        self.timeline_widget = QWidget()
+        tlayout = QHBoxLayout(self.timeline_widget)
+        tlayout.setContentsMargins(0, 0, 0, 0)
+        self.timeline = Timeline()
+        self.timeline.set_label_fn(self._timeline_hover_label)
+        self.timeline.seekRequested.connect(self._on_timeline_seek)
+        self.behind_live_label = QLabel("")
+        self.behind_live_label.setMinimumWidth(120)
+        self.behind_live_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        tlayout.addWidget(self.timeline, 1)
+        tlayout.addWidget(self.behind_live_label)
+        rlayout.addWidget(self.timeline_widget)
+
         self.controls_widget = QWidget()
         controls = QHBoxLayout(self.controls_widget)
         controls.setContentsMargins(0, 0, 0, 0)
+        live_btn = QPushButton("⏮ Live")
+        live_btn.clicked.connect(self._seek_live)
+        back10_btn = QPushButton("−10s")
+        back10_btn.clicked.connect(lambda: self._seek_relative(-10))
+        self.pause_btn = QPushButton("⏸")
+        self.pause_btn.clicked.connect(self._pause_toggle)
+        fwd10_btn = QPushButton("+10s")
+        fwd10_btn.clicked.connect(lambda: self._seek_relative(10))
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._on_play_clicked)
         stop_btn = QPushButton("Stop")
@@ -293,11 +357,13 @@ class MainWindow(QMainWindow):
         self.volume = QSlider(Qt.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
+        self.volume.setMaximumWidth(120)
         self.volume.valueChanged.connect(self._on_volume)
-        controls.addWidget(self.play_btn)
-        controls.addWidget(stop_btn)
+        for w in (live_btn, back10_btn, self.pause_btn, fwd10_btn, self.play_btn, stop_btn):
+            controls.addWidget(w)
+        controls.addStretch(1)
         controls.addWidget(QLabel("🔊"))
-        controls.addWidget(self.volume, 1)
+        controls.addWidget(self.volume)
         controls.addWidget(fs_btn)
         rlayout.addWidget(self.controls_widget)
         splitter.addWidget(right)
@@ -307,13 +373,26 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         # widgets hidden when the video goes fullscreen
-        self._chrome = [self.group_list, middle, self.now_playing, self.controls_widget]
+        self._chrome = [
+            self.group_list,
+            middle,
+            self.now_playing,
+            self.timeline_widget,
+            self.controls_widget,
+        ]
 
         # search debounce
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._apply_search)
+
+        # DVR position polling (updates the timeline from the active target)
+        self._pos_timer = QTimer(self)
+        self._pos_timer.setInterval(1000)
+        self._pos_timer.timeout.connect(self._update_timeline)
+        self._pos_timer.start()
+        self._window_seconds = 0.0  # current buffered window length
 
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
@@ -416,15 +495,45 @@ class MainWindow(QMainWindow):
     def _on_play_clicked(self) -> None:
         self._play(self._selected_channel())
 
+    # ---- DVR stream lifecycle (recorder + relay feed both local and cast) --- #
+    def _ensure_stream(self, channel: Channel) -> str:
+        """Start (or reuse) the DVR recorder+relay for this channel and return the
+        local seekable manifest URL that both VLC and the Chromecast play."""
+        if (
+            self._recorder is not None
+            and self._active_channel is not None
+            and self._active_channel.url == channel.url
+        ):
+            return self.proxy.manifest_url()
+        self._teardown_stream()
+        dvr_dir = default_config_path().parent / "dvr" / uuid4().hex
+        self._recorder = Recorder(to_hls_url(channel.url), dvr_dir)
+        self._recorder.start()
+        self.proxy.attach_recorder(self._recorder)
+        self.proxy.start()
+        self._active_channel = channel
+        return self.proxy.manifest_url()
+
+    def _teardown_stream(self) -> None:
+        if self._recorder is not None:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+            self._recorder = None
+        self._active_channel = None
+
     def _play(self, channel: Channel | None) -> None:
         if channel is None or self.player is None:
             return
         try:
-            self.player.play(channel.url)
+            url = self._ensure_stream(channel)
+            self.player.play(url)
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
             return
+        self._is_casting = False
         self.now_playing.setText(channel.name)
         self.config.last_watched = {
             "group": channel.group,
@@ -436,11 +545,75 @@ class MainWindow(QMainWindow):
     def _on_stop_clicked(self) -> None:
         if self.player:
             self.player.stop()
+        self._teardown_stream()
+        self._is_casting = False
         self.now_playing.setText("Nothing playing")
 
     def _on_volume(self, value: int) -> None:
         if self.player:
             self.player.set_volume(value)
+
+    # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
+    def _target_position_length(self) -> tuple[float, float]:
+        window = 0.0
+        if self._recorder is not None:
+            window = sum(s.duration for s in self._recorder.snapshot())
+        if self._is_casting and self.cast_manager.is_active():
+            pos = self.cast_manager.current_time() or 0.0
+        elif self.player is not None:
+            pos = self.player.time_s()
+        else:
+            pos = 0.0
+        return pos, window
+
+    def _seek_to(self, t: float) -> None:
+        _, window = self._target_position_length()
+        t = clamp_seek(t, 0.0, max(0.0, window))
+        if self._is_casting and self.cast_manager.is_active():
+            self.cast_manager.seek(t)
+        elif self.player is not None:
+            self.player.seek_s(t)
+
+    def _seek_relative(self, delta: float) -> None:
+        pos, _ = self._target_position_length()
+        self._seek_to(pos + delta)
+
+    def _seek_live(self) -> None:
+        _, window = self._target_position_length()
+        self._seek_to(max(0.0, window - 2.0))
+
+    def _pause_toggle(self) -> None:
+        if self._is_casting and self.cast_manager.is_active():
+            if self.cast_manager.is_paused():
+                self.cast_manager.resume()
+            else:
+                self.cast_manager.pause()
+        elif self.player is not None:
+            self.player.pause()
+
+    def _timeline_hover_label(self, fraction: float) -> str:
+        return hover_label(fraction * self._window_seconds, self._window_seconds)
+
+    def _on_timeline_seek(self, fraction: float) -> None:
+        self._seek_to(fraction * self._window_seconds)
+
+    def _update_timeline(self) -> None:
+        active = self._recorder is not None
+        self.timeline.setEnabled(active)
+        if not active:
+            self.behind_live_label.setText("")
+            return
+        pos, window = self._target_position_length()
+        self._window_seconds = window
+        if window > 0 and not self.timeline.isSliderDown():
+            self.timeline.setValue(int(min(1.0, pos / window) * 1000))
+        self.behind_live_label.setText(hover_label(pos, window) if window > 0 else "buffering…")
+        paused = (
+            self.cast_manager.is_paused()
+            if (self._is_casting and self.cast_manager.is_active())
+            else (self.player.is_paused() if self.player else False)
+        )
+        self.pause_btn.setText("▶" if paused else "⏸")
 
     def _toggle_fullscreen(self) -> None:
         # VLC's own fullscreen is a no-op for an embedded surface on macOS, so we
@@ -525,16 +698,15 @@ class MainWindow(QMainWindow):
     def _start_cast(self, channel: Channel, uuid_str: str) -> None:
         if self.player:
             self.player.stop()
-        # Route the stream through the local relay (the provider's redirect +
+        # Route through the local DVR relay (the provider's redirect +
         # session-hashed segments can't be played by the Chromecast directly),
         # and keep the Mac awake so the relay stays alive while casting.
-        self.proxy.set_source(to_hls_url(channel.url))
         try:
-            self.proxy.start()
+            local_url = self._ensure_stream(channel)
         except Exception as exc:
             self._on_cast_failed(f"Couldn't start local relay: {exc}")
             return
-        local_url = self.proxy.manifest_url()
+        self._is_casting = True
         self._keep_awake.on()
         self.now_playing.setText(f"📺 Casting '{channel.name}'…")
         self.statusBar().showMessage("Connecting to cast device…")
@@ -556,6 +728,7 @@ class MainWindow(QMainWindow):
 
     def _on_cast_failed(self, message: str) -> None:
         self._keep_awake.off()
+        self._is_casting = False
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Couldn't cast to device")
         QMessageBox.warning(self, "Cast failed", message)
@@ -570,12 +743,14 @@ class MainWindow(QMainWindow):
 
     def _on_cast_stopped(self) -> None:
         self._keep_awake.off()
+        self._is_casting = False
+        self._teardown_stream()
         self.now_playing.setText("Nothing playing")
         self.statusBar().showMessage("Cast stopped")
 
     def closeEvent(self, event) -> None:
         self._keep_awake.off()
-        for closer in (self.proxy.stop, self.cast_manager.shutdown):
+        for closer in (self._teardown_stream, self.proxy.stop, self.cast_manager.shutdown):
             try:
                 closer()
             except Exception:
