@@ -80,9 +80,16 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
 The rolling 1-hour buffer is written to
 `~/Library/Application Support/M3UPlayer/dvr/` while a channel is active and
 cleared when you switch channels, stop, or quit. A full hour is roughly
-2–3 GB for HD and up to ~10 GB for UHD. Because both local playback and casting
-run through this buffer, live is ~15–30s behind real-time; **⏮ Live** jumps to
-the newest buffered moment.
+2–3 GB for HD and up to ~10 GB for UHD.
+
+**How it stays close to live.** The app doesn't use the provider's HLS (10-second
+chunks). It feeds the raw stream to ffmpeg and **re-segments it locally into
+short segments** (`-c copy`, no transcoding, so it's cheap). This matters because
+a player needs a couple of segments of lookahead before playback resumes — with
+10s chunks that forces ~30s of delay behind live and a long stall on
+**Live ⏭**, whereas short local segments let you sit ~5s behind live and resume
+in ~3s. ffmpeg also manages the rolling window, deleting segments as they age
+out.
 
 ### Why URL support matters
 

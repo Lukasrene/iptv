@@ -44,10 +44,13 @@ class Thumbnailer:
                     if seg.media_seq in self._done:
                         continue
                 out = self._out / f"{seg.media_seq}.jpg"
-                ss = min(2.0, max(0.0, seg.duration / 2.0))
+                # Grab the first frame. Don't use an input -ss seek: remuxed
+                # segments keep the source's original timestamps (they don't
+                # start at 0), so seeking lands outside the segment and yields
+                # no packets. Each segment starts on a keyframe anyway.
                 try:
                     subprocess.run(
-                        [self._ffmpeg, "-y", "-ss", str(ss), "-i", seg.path,
+                        [self._ffmpeg, "-y", "-i", seg.path, "-an",
                          "-frames:v", "1", "-vf", f"scale={self._width}:-1",
                          "-q:v", "6", str(out)],
                         capture_output=True, timeout=15,

@@ -7,7 +7,7 @@ LIVE_EPSILON = 2.0
 # exactly on the newest segment starves the player (nothing buffered ahead), which
 # is what makes "jump to live" stall — keeping ~1 segment of runway makes it
 # feel instant.
-LIVE_MARGIN = 12.0
+LIVE_MARGIN = 6.0
 
 
 def fmt_hms(seconds: float) -> str:

@@ -38,7 +38,6 @@ import time
 from uuid import uuid4
 
 from m3u_player.caster import CastManager
-from m3u_player.hls import to_hls_url
 from m3u_player.playlist import Channel, parse_m3u
 from m3u_player.proxy import HlsProxy
 from m3u_player.recorder import Recorder
@@ -609,7 +608,10 @@ class MainWindow(QMainWindow):
             return self.proxy.manifest_url()
         self._teardown_stream()
         dvr_dir = default_config_path().parent / "dvr" / uuid4().hex
-        self._recorder = Recorder(to_hls_url(channel.url), dvr_dir)
+        # Feed the raw continuous stream to ffmpeg and re-segment it locally into
+        # short segments — that's what lets us sit a few seconds behind live
+        # instead of ~30s (see Recorder docstring).
+        self._recorder = Recorder(channel.url, dvr_dir)
         self._recorder.start()
         self.proxy.attach_recorder(self._recorder)
         self.proxy.start()
@@ -681,8 +683,10 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         snap = self._recorder.snapshot() if self._recorder is not None else []
         raw_window = sum(s.duration for s in snap)
-        # one segment of runway — as close to live as we can safely sit
-        margin = snap[-1].duration if snap else LIVE_MARGIN
+        # A player needs a little more than one segment of lookahead before it
+        # resumes, so scale the margin to the actual segment length. With locally
+        # re-segmented short segments this lands only a few seconds behind live.
+        margin = max(4.0, 1.2 * snap[-1].duration) if snap else LIVE_MARGIN
         safe_live = max(0.0, raw_window - margin)
         display_live = self._live_clock.update(safe_live, now) or 0.0
         return raw_window, safe_live, display_live
