@@ -56,7 +56,12 @@ def _manifest_lines(segments: list[RecordedSeg], local_base: str) -> list[str]:
     return lines
 
 
-LIVE_WINDOW_SEGMENTS = 20
+# ~3 minutes of lookahead at 2s segments. This is a starvation guard, not a
+# style choice: measured over 4 minutes, a 20-segment window stalled three times
+# for 100s in total, while 90 segments ran clean. A live playlist still has to
+# be bounded — handing a client the whole retained hour makes it buffer the lot
+# before showing anything.
+LIVE_WINDOW_SEGMENTS = 90
 
 
 def build_dvr_manifest(

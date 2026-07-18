@@ -90,3 +90,27 @@ def test_eviction_tracker_ignores_empty_snapshot():
     t.observe([RecordedSeg(1, "a", 2.0), RecordedSeg(2, "b", 2.0)])
     t.observe([])
     assert t.evicted_seconds == 0.0
+
+
+def test_snapshot_reparses_only_when_the_index_changes(tmp_path):
+    """The UI polls this 4x/second; re-parsing every time stutters playback."""
+    import m3u_player.recorder as R
+    rec = R.Recorder("http://example.com/USER/PASS/1.ts", tmp_path)
+    index = tmp_path / "index.m3u8"
+    index.write_text("#EXTM3U\n#EXTINF:2.000,\nseg_000001.ts\n")
+    calls = []
+    real = R.parse_hls_index
+    R.parse_hls_index = lambda t, d: (calls.append(1), real(t, d))[1]
+    try:
+        assert len(rec.snapshot()) == 1
+        rec.snapshot(); rec.snapshot()
+        assert len(calls) == 1, "unchanged index must not be re-parsed"
+
+        # a new segment changes the index -> must be picked up
+        import os, time
+        index.write_text("#EXTM3U\n#EXTINF:2.000,\nseg_000001.ts\n#EXTINF:2.000,\nseg_000002.ts\n")
+        os.utime(index, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+        assert len(rec.snapshot()) == 2
+        assert len(calls) == 2
+    finally:
+        R.parse_hls_index = real

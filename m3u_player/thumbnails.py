@@ -8,6 +8,14 @@ from pathlib import Path
 from m3u_player.recorder import ffmpeg_exe
 
 
+def _lower_priority() -> None:
+    """Run the child at reduced scheduling priority (POSIX only)."""
+    try:
+        os.nice(10)
+    except Exception:
+        pass
+
+
 class Thumbnailer:
     """Extracts one small preview frame per buffered DVR segment (using the
     bundled ffmpeg) so the timeline can show a scene thumbnail on hover.
@@ -50,16 +58,25 @@ class Thumbnailer:
                 # no packets. Each segment starts on a keyframe anyway.
                 try:
                     subprocess.run(
-                        [self._ffmpeg, "-y", "-i", seg.path, "-an",
+                        [self._ffmpeg, "-y", "-threads", "1", "-i", seg.path, "-an",
                          "-frames:v", "1", "-vf", f"scale={self._width}:-1",
                          "-q:v", "6", str(out)],
                         capture_output=True, timeout=15,
+                        # Previews are a nicety; decoding the video the user is
+                        # actually watching is not. Without this the extractor
+                        # competes with playback for CPU on every new segment,
+                        # which shows up as picture and audio breaking up.
+                        preexec_fn=_lower_priority,
                     )
                 except Exception:
                     continue
                 if out.exists() and out.stat().st_size > 0:
                     with self._lock:
                         self._done[seg.media_seq] = str(out)
+                # Yield between segments so catching up on a backlog doesn't
+                # monopolise the machine either.
+                if self._stop.wait(0.2):
+                    break
             self._prune(snap)
             self._stop.wait(1.0)
 

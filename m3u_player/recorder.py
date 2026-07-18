@@ -128,6 +128,8 @@ class Recorder:
         # snapshot() is polled from the UI thread and from proxy request threads
         self._lock = threading.Lock()
         self._evictions = EvictionTracker()
+        self._cache: list[RecordedSeg] | None = None
+        self._cache_stamp = -1
 
     def start(self) -> None:
         if self._proc is not None:
@@ -189,20 +191,34 @@ class Recorder:
         return True
 
     def snapshot(self) -> list[RecordedSeg]:
-        """Current on-disk segments, read fresh from the index every time.
+        """Current on-disk segments, re-parsed only when the index changes.
 
-        Do not add a cache here. It is tempting — this is polled by the UI and
-        hit for every proxy request — but ffmpeg deletes segments underneath us,
-        and a cached list keeps handing out paths to files that are already gone.
-        Serving those stalls playback. Measured: a 250ms cache was enough to
-        freeze rewound playback outright.
+        This is polled ~4x/second by the UI *and* hit for every proxy request,
+        and the index grows to a few thousand lines over a full buffer. Parsing
+        it every time is enough work on the UI thread — the same thread that
+        renders video — to break up picture and audio.
+
+        The cache key is the index's mtime, not elapsed time. ffmpeg rewrites
+        index.m3u8 whenever it adds or deletes a segment, so an unchanged mtime
+        means the segment list is genuinely unchanged. A time-based cache is
+        *not* safe here and was measured freezing playback: it keeps handing out
+        paths to segments ffmpeg has already deleted.
         """
+        try:
+            stamp = self._index.stat().st_mtime_ns
+        except OSError:
+            return []
+        with self._lock:
+            if self._cache is not None and stamp == self._cache_stamp:
+                return self._cache
         try:
             segs = parse_hls_index(self._index.read_text(), self._dir)
         except OSError:
             return []
         with self._lock:
             self._evictions.observe(segs)
+            self._cache = segs
+            self._cache_stamp = stamp
         return segs
 
     def evicted_seconds(self) -> float:
