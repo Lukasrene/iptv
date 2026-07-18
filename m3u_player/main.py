@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import QAction, QColor, QPalette, QPixmap
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -48,7 +49,6 @@ from m3u_player.store import Config, default_config_path
 from m3u_player.thumbnails import Thumbnailer
 from m3u_player.transport import (
     LIVE_EPSILON,
-    LIVE_MARGIN,
     SeekAccumulator,
     SmoothedClock,
     clamp_seek,
@@ -57,6 +57,17 @@ from m3u_player.transport import (
 )
 
 FAVORITES_LABEL = "★ Favorites"
+
+# How close to the end of the armed VOD snapshot playback may get before we
+# re-arm against a fresher one. A re-arm costs a seek (~0.2s), so this trades
+# a small periodic hitch against playback hitting the end of the snapshot and
+# stopping. Raise it if re-arms become audible.
+REARM_MARGIN = 12.0
+
+# How much buffer must exist before playback hands off from the raw provider
+# stream to the local relay. Enough to play from, small enough that the handoff
+# happens well before the raw connection becomes unreliable.
+HANDOFF_MIN_BUFFER = 12.0
 
 
 class KeepAwake:
@@ -215,18 +226,16 @@ class OpenDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
-# Video frame (native window for VLC + double-click to toggle fullscreen)
+# Video frame (Qt-owned video surface + double-click to toggle fullscreen)
 # --------------------------------------------------------------------------- #
-class VideoFrame(QWidget):
+class VideoFrame(QVideoWidget):
     doubleClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WA_NativeWindow, True)
         # focusable so playback shortcuts reach the window (clicking the video
         # takes focus away from the channel list, where arrows navigate instead)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
         self.setPalette(pal)
@@ -512,6 +521,7 @@ class MainWindow(QMainWindow):
         self._pos_timer.timeout.connect(self._update_timeline)
         self._pos_timer.start()
         self._window_seconds = 0.0  # current buffered window length
+        self._dvr_origin = 0.0  # absolute start of the armed VOD snapshot
 
         # debounce that fires one coalesced seek after rapid ±5s presses
         self._seek_commit_timer = QTimer(self)
@@ -532,7 +542,7 @@ class MainWindow(QMainWindow):
     # ---- player binding (after the native window exists) --------------- #
     def bind_player(self, player) -> None:
         self.player = player
-        self.player.bind_window(self.video_frame)
+        self.player.bind_surface(self.video_frame)
         self.player.set_volume(self.volume.value())
 
     # ---- loading ------------------------------------------------------- #
@@ -698,15 +708,25 @@ class MainWindow(QMainWindow):
             self.player.set_volume(value)
 
     # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
+    # All positions below are *absolute*: seconds since this recording started,
+    # not offsets into the current buffer. ffmpeg drops segments off the front of
+    # the rolling window, and measuring from the buffer start would slide the
+    # whole timeline underneath the viewer each time that happened.
+    def _buffer_start(self) -> float:
+        """Absolute position of the oldest segment still on disk."""
+        return self._recorder.evicted_seconds() if self._recorder is not None else 0.0
+
     def _safe_live(self) -> float:
-        """Furthest actually-playable position in the DVR buffer (no smoothing)."""
+        """Furthest actually-playable absolute position (no smoothing)."""
         snap = self._recorder.snapshot() if self._recorder is not None else []
-        raw_window = sum(s.duration for s in snap)
-        margin = max(4.0, 1.2 * snap[-1].duration) if snap else LIVE_MARGIN
-        return max(0.0, raw_window - margin)
+        if not snap:
+            return 0.0
+        end = self._buffer_start() + sum(s.duration for s in snap)
+        margin = max(4.0, 1.2 * snap[-1].duration)
+        return max(self._buffer_start(), end - margin)
 
     def _stream_extents(self) -> tuple[float, float, float]:
-        """Return (raw_window, safe_live, display_live) in seconds.
+        """Return (buffer_start, safe_live, display_live) — all absolute seconds.
 
         ``safe_live`` is the furthest position that is actually *playable*: the
         start of the newest complete segment, so there is a full segment of
@@ -719,11 +739,21 @@ class MainWindow(QMainWindow):
         seek target: it runs ahead of what has actually been downloaded.
         """
         now = time.monotonic()
-        snap = self._recorder.snapshot() if self._recorder is not None else []
-        raw_window = sum(s.duration for s in snap)
         safe_live = self._safe_live()
         display_live = self._live_clock.update(safe_live, now) or 0.0
-        return raw_window, safe_live, display_live
+        return self._buffer_start(), safe_live, display_live
+
+    # ---- timeline maps the buffered span [start, safe_live] onto 0..1 ---- #
+    def _fraction_to_abs(self, fraction: float) -> float:
+        start, safe_live, _ = self._stream_extents()
+        return start + fraction * max(0.0, safe_live - start)
+
+    def _abs_to_fraction(self, pos: float) -> float:
+        start, safe_live, _ = self._stream_extents()
+        span = safe_live - start
+        if span <= 0:
+            return 0.0
+        return max(0.0, min(1.0, (pos - start) / span))
 
     def _current_position(self) -> float:
         now = time.monotonic()
@@ -735,8 +765,15 @@ class MainWindow(QMainWindow):
         if self._play_mode == "direct":
             return self._safe_live()  # watching the raw live stream
         if self.player is not None:
-            return self.player.time_s()
+            # player time is relative to the armed snapshot's first segment
+            return self._dvr_origin + self.player.time_s()
         return 0.0
+
+    def _arm_dvr(self) -> None:
+        """Point the player at a fresh VOD snapshot and remember its origin."""
+        segs = self._recorder.snapshot()
+        self._dvr_origin = self._recorder.origin_for(segs)
+        self.player.play(self.proxy.dvr_url())
 
     def _switch_to_dvr(self, target: float) -> bool:
         """Move local playback onto the DVR relay so it can seek.
@@ -745,15 +782,61 @@ class MainWindow(QMainWindow):
         """
         if self.player is None or self._recorder is None:
             return False
-        safe_live = self._safe_live()
-        if safe_live <= 0:
+        start, safe_live, _ = self._stream_extents()
+        if safe_live <= start:
             self.statusBar().showMessage("Buffering — rewind available in a moment")
             return False
         if self._play_mode != "dvr":
-            self.player.play(self.proxy.manifest_url())
+            self._arm_dvr()
             self._play_mode = "dvr"
-        self._pending_dvr_seek = clamp_seek(target, 0.0, safe_live)
+        self._pending_dvr_seek = clamp_seek(target, start, safe_live)
         return True
+
+    def _maybe_handoff_to_dvr(self) -> None:
+        """Hand off from the raw stream to the local relay once it can carry us.
+
+        The raw provider stream exists only to get a picture up fast (~1.4s, vs
+        several seconds waiting for the first segments). It is not a good bet for
+        sustained playback: it is a single long-lived connection to the provider,
+        and it was measured dying after ~30s while the recorder — reading the
+        same source through ffmpeg — stayed healthy indefinitely.
+
+        So once the buffer holds enough to play from, we move onto it at the live
+        edge. The handoff costs one seek (~0.2s), and from then on playback is
+        reading local disk, which also means rewinding is instant.
+        """
+        if (
+            self._play_mode != "direct"
+            or self.player is None
+            or self._recorder is None
+            or self._is_casting
+        ):
+            return
+        start, safe_live, _ = self._stream_extents()
+        if safe_live - start < HANDOFF_MIN_BUFFER:
+            return
+        self._switch_to_dvr(safe_live)
+
+    def _rearm_dvr(self) -> None:
+        """Re-point at a fresher snapshot, preserving position.
+
+        A VOD manifest is frozen at the newest segment it listed, so playback
+        behind live would otherwise simply stop when it reached that point.
+        Re-arming costs one seek (~0.2s), which is why this is tolerable at all.
+        If we have already caught up to live, go back to the raw stream instead —
+        that is genuinely live and needs no buffer.
+        """
+        if self.player is None or self._recorder is None:
+            return
+        pos = self._current_position()
+        _, safe_live, _ = self._stream_extents()
+        if pos >= safe_live - LIVE_EPSILON:
+            self._seek_live()
+            return
+        was_paused = self.player.is_paused()
+        self._arm_dvr()
+        self._pending_dvr_seek = pos
+        self._pause_after_switch = was_paused
 
     def _target_position_length(self) -> tuple[float, float]:
         """(position, display live edge) — for the readout only."""
@@ -763,17 +846,24 @@ class MainWindow(QMainWindow):
     def _seek_to(self, t: float) -> None:
         # Clamp to what is actually downloaded — never the projected edge, or the
         # player waits for content that does not exist yet.
-        safe_live = self._safe_live()
-        t = clamp_seek(t, 0.0, safe_live)
+        start, safe_live, _ = self._stream_extents()
+        t = clamp_seek(t, start, safe_live)
         if self._is_casting and self.cast_manager.is_active():
-            self.cast_manager.seek(t)
+            # the cast receiver plays the live manifest, whose timeline still
+            # starts at the buffer front
+            self.cast_manager.seek(t - start)
             return
         if self._play_mode == "direct":
             # rewinding for the first time: hop onto the DVR relay at that point
             self._switch_to_dvr(t)
             return
         if self.player is not None:
-            self.player.seek_s(t)
+            if t < self._dvr_origin:
+                # older than the armed snapshot — re-arm to reach it
+                self._arm_dvr()
+                self._pending_dvr_seek = t
+                return
+            self.player.seek_s(t - self._dvr_origin)
 
     def _seek_relative(self, delta: float) -> None:
         self._seek_to(self._current_position() + delta)
@@ -781,14 +871,21 @@ class MainWindow(QMainWindow):
     def _seek_live(self) -> None:
         self._seek_acc.take()  # cancel any pending stacked step
         if self._is_casting and self.cast_manager.is_active():
-            self.cast_manager.seek(self._safe_live())
+            self.cast_manager.seek(self._safe_live() - self._buffer_start())
             return
-        # Locally, going live means going back to the raw stream: genuinely live
-        # and it starts immediately, instead of seeking inside the buffer.
-        if self._active_channel is not None and self.player is not None:
-            self.player.play(self._active_channel.url)
-            self._play_mode = "direct"
-            self._pending_dvr_seek = None
+        # Going live means seeking to the live edge of the buffer, not reopening
+        # the raw provider stream. The raw stream is only ever a bootstrap for
+        # the first few seconds (see _maybe_handoff_to_dvr) — reopening it here
+        # would drop playback back onto the connection that proved unreliable,
+        # and would throw away the buffer we can rewind into.
+        #
+        # Re-arm first: the currently armed snapshot was frozen when it was
+        # built, so it does not reach the live edge yet and seeking into it would
+        # land short by however long we have been watching it.
+        if self._recorder is not None and self.player is not None:
+            self._arm_dvr()
+            self._play_mode = "dvr"
+            self._pending_dvr_seek = self._safe_live()
             self._pause_after_switch = False
 
     def _pause_toggle(self) -> None:
@@ -809,11 +906,11 @@ class MainWindow(QMainWindow):
 
     def _seek_step(self, delta: float) -> None:
         # Coalesce rapid presses: stack onto the pending target and fire once.
-        _, safe_live, display_live = self._stream_extents()
-        target = self._seek_acc.add(delta, self._current_position(), 0.0, safe_live)
+        start, safe_live, display_live = self._stream_extents()
+        target = self._seek_acc.add(delta, self._current_position(), start, safe_live)
         self._window_seconds = safe_live
-        if safe_live > 0:
-            self.timeline.setValue(int(min(1.0, target / safe_live) * 1000))
+        if safe_live > start:
+            self.timeline.setValue(int(self._abs_to_fraction(target) * 1000))
             self.behind_live_label.setText(self._behind_text(target, safe_live, display_live))
         self._seek_commit_timer.start()
 
@@ -829,13 +926,13 @@ class MainWindow(QMainWindow):
             self._seek_to(target)
 
     def _on_timeline_seek(self, fraction: float) -> None:
-        self._seek_to(fraction * self._window_seconds)
+        self._seek_to(self._fraction_to_abs(fraction))
 
     def _on_timeline_hover(self, fraction: float, global_pos) -> None:
-        _, safe_live, display_live = self._stream_extents()
-        if safe_live <= 0:
+        start, safe_live, display_live = self._stream_extents()
+        if safe_live <= start:
             return
-        hovered = fraction * safe_live
+        hovered = self._fraction_to_abs(fraction)
         pos = self._current_position()
         text = (
             f"{signed_delta_label(hovered, pos)}   "
@@ -857,27 +954,46 @@ class MainWindow(QMainWindow):
         if not active:
             self.behind_live_label.setText("")
             return
-        # apply a deferred seek once the relay has actually opened
+        # apply a deferred seek once the relay has actually opened and reports a
+        # real duration (a VOD manifest is seekable, the raw live stream is not)
         if (
             self._pending_dvr_seek is not None
             and self._play_mode == "dvr"
             and self.player is not None
-            and self.player.length_s() > 0
+            and self.player.is_seekable()
         ):
-            self.player.seek_s(self._pending_dvr_seek)
+            self.player.seek_s(max(0.0, self._pending_dvr_seek - self._dvr_origin))
             self._pending_dvr_seek = None
             if self._pause_after_switch:
                 self.player.pause()
                 self._pause_after_switch = False
+        # A VOD snapshot ends at the newest segment it listed. Re-arm before
+        # playback runs into that wall.
+        elif (
+            self._pending_dvr_seek is None
+            and self._play_mode == "dvr"
+            and self.player is not None
+            and not self.player.is_paused()
+            and self.player.at_end_of_buffer(REARM_MARGIN)
+        ):
+            self._rearm_dvr()
 
-        _, safe_live, display_live = self._stream_extents()
+        # the upstream connection can drop (VPN reconnect, provider reset);
+        # relaunch it so the buffer resumes growing instead of freezing
+        if self._recorder is not None and self._recorder.restart_if_dead():
+            self.statusBar().showMessage("Stream interrupted — reconnecting…", 4000)
+
+        # bootstrap done? move off the raw provider stream onto the relay
+        self._maybe_handoff_to_dvr()
+
+        start, safe_live, display_live = self._stream_extents()
         pos = self._current_position()
         self._window_seconds = safe_live
         # don't fight an active drag or a pending coalesced seek
-        if safe_live > 0 and not self.timeline.isSliderDown() and not self._seek_acc.pending:
-            self.timeline.setValue(int(min(1.0, pos / safe_live) * 1000))
+        if safe_live > start and not self.timeline.isSliderDown() and not self._seek_acc.pending:
+            self.timeline.setValue(int(self._abs_to_fraction(pos) * 1000))
             self.behind_live_label.setText(self._behind_text(pos, safe_live, display_live))
-        elif safe_live <= 0:
+        elif safe_live <= start:
             self.behind_live_label.setText("buffering…")
         paused = (
             self.cast_manager.is_paused()

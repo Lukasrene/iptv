@@ -40,3 +40,53 @@ def test_ignores_comments_and_unknown_lines():
 
 def test_empty_index_yields_nothing():
     assert parse_hls_index("#EXTM3U\n", "/dvr") == []
+
+
+# --------------------------------------------------------------------------- #
+# Absolute timeline.
+#
+# ffmpeg's rolling window deletes segments off the front, which used to shift
+# every UI position underneath the viewer. media_seq increments monotonically
+# for the life of a recording, so it anchors an absolute timeline; the recorder
+# accumulates the duration of everything that has aged out.
+# --------------------------------------------------------------------------- #
+from m3u_player.recorder import EvictionTracker
+
+
+def test_eviction_tracker_starts_at_zero():
+    assert EvictionTracker().evicted_seconds == 0.0
+
+
+def test_eviction_tracker_ignores_a_stable_window():
+    t = EvictionTracker()
+    segs = [RecordedSeg(1, "a", 2.0), RecordedSeg(2, "b", 2.0)]
+    t.observe(segs)
+    t.observe(segs)
+    assert t.evicted_seconds == 0.0
+
+
+def test_eviction_tracker_accumulates_dropped_segments():
+    t = EvictionTracker()
+    t.observe([RecordedSeg(1, "a", 2.0), RecordedSeg(2, "b", 3.0)])
+    # seg 1 ages out, seg 3 arrives
+    t.observe([RecordedSeg(2, "b", 3.0), RecordedSeg(3, "c", 2.0)])
+    assert t.evicted_seconds == 2.0
+    # seg 2 ages out too
+    t.observe([RecordedSeg(3, "c", 2.0)])
+    assert t.evicted_seconds == 5.0
+
+
+def test_eviction_tracker_survives_a_gap_between_snapshots():
+    """Several segments can age out between two polls."""
+    t = EvictionTracker()
+    t.observe([RecordedSeg(n, str(n), 2.0) for n in (1, 2, 3, 4)])
+    t.observe([RecordedSeg(4, "4", 2.0)])
+    assert t.evicted_seconds == 6.0
+
+
+def test_eviction_tracker_ignores_empty_snapshot():
+    """An unreadable index must not be mistaken for total eviction."""
+    t = EvictionTracker()
+    t.observe([RecordedSeg(1, "a", 2.0), RecordedSeg(2, "b", 2.0)])
+    t.observe([])
+    assert t.evicted_seconds == 0.0

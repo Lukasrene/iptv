@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +48,40 @@ def parse_hls_index(text: str, directory) -> list[RecordedSeg]:
     return out
 
 
+class EvictionTracker:
+    """Tracks how much recorded material has aged out of the rolling window.
+
+    ffmpeg's ``delete_segments`` drops segments off the front of the buffer. If
+    the UI measured positions as offsets into the *current* buffer, the whole
+    timeline would slide underneath the viewer every time that happened. Adding
+    the evicted duration back gives a position that stays put.
+
+    ``media_seq`` increments monotonically for the life of a recording, so it is
+    a stable anchor even across a poll that misses several segments.
+    """
+
+    def __init__(self):
+        self._known: dict[int, float] = {}
+        self._evicted = 0.0
+
+    @property
+    def evicted_seconds(self) -> float:
+        return self._evicted
+
+    def observe(self, segments: list[RecordedSeg]) -> None:
+        if not segments:
+            # An unreadable index reads as an empty snapshot. Treating that as
+            # "everything was evicted" would jump the timeline; ignore it.
+            return
+        oldest = segments[0].media_seq
+        for seq, duration in list(self._known.items()):
+            if seq < oldest:
+                self._evicted += duration
+                del self._known[seq]
+        for s in segments:
+            self._known[s.media_seq] = s.duration
+
+
 class Recorder:
     """Remuxes the provider's continuous MPEG-TS stream into small local HLS
     segments using ffmpeg (``-c copy`` — no transcoding, so it's cheap).
@@ -65,6 +101,10 @@ class Recorder:
         self._segment_seconds = segment_seconds
         self._list_size = max(10, int(max_seconds / max(1.0, segment_seconds)))
         self._proc: subprocess.Popen | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=20)
+        # snapshot() is polled from the UI thread and from proxy request threads
+        self._lock = threading.Lock()
+        self._evictions = EvictionTracker()
 
     def start(self) -> None:
         if self._proc is not None:
@@ -84,18 +124,82 @@ class Recorder:
             "-hls_segment_filename", str(self._dir / "seg_%06d.ts"),
             str(self._index),
         ]
+        # Keep the tail of stderr. ffmpeg dying used to be silent, which made a
+        # dead DVR buffer indistinguishable from a slow one — the UI would just
+        # sit at "buffering…" forever with no way to find out why.
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        for raw in proc.stderr:
+            line = raw.decode("utf-8", "replace").strip()
+            if line:
+                self._stderr_tail.append(line)
+
+    def last_error(self) -> str:
+        """Most recent ffmpeg stderr lines — why the buffer stopped filling."""
+        return "\n".join(self._stderr_tail)
 
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def restart_if_dead(self) -> bool:
+        """Relaunch ffmpeg if it exited. Returns True if a restart happened.
+
+        The upstream connection is long-lived and can drop for reasons outside
+        the app — a VPN reconnecting, the provider resetting, the network
+        changing. Left alone the buffer simply stops growing and the UI sits at
+        a frozen live edge, so recover instead.
+
+        ``append_list`` means the relaunched ffmpeg continues the existing index
+        rather than truncating it, so the buffer and its media sequence survive.
+        """
+        if self._proc is None or self.is_alive():
+            return False
+        self._proc = None
+        self.start()
+        return True
+
     def snapshot(self) -> list[RecordedSeg]:
         try:
-            return parse_hls_index(self._index.read_text(), self._dir)
+            segs = parse_hls_index(self._index.read_text(), self._dir)
         except OSError:
             return []
+        with self._lock:
+            self._evictions.observe(segs)
+        return segs
+
+    def evicted_seconds(self) -> float:
+        """Duration that has aged out of the rolling window — the origin of the
+        absolute timeline. Only meaningful after ``snapshot()`` has been polled."""
+        with self._lock:
+            return self._evictions.evicted_seconds
+
+    def extent(self) -> tuple[float, float]:
+        """Absolute ``(start, end)`` of the buffer, in seconds since recording began."""
+        segs = self.snapshot()
+        start = self.evicted_seconds()
+        return start, start + sum(s.duration for s in segs)
+
+    def origin_for(self, segments: list[RecordedSeg]) -> float:
+        """Absolute start time of a manifest built from ``segments``.
+
+        Player positions are relative to the first segment in whatever snapshot
+        was armed, so converting to the absolute timeline needs this offset.
+        """
+        if not segments:
+            return self.evicted_seconds()
+        start = self.evicted_seconds()
+        for s in self.snapshot():
+            if s.media_seq == segments[0].media_seq:
+                return start
+            start += s.duration
+        return start
 
     def segment_seconds(self) -> float:
         """Actual segment length being produced (ffmpeg cuts on keyframes, so it

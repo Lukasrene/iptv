@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # This repo may live in an iCloud-synced folder. iCloud evicts binary files to
-# the cloud, which breaks Qt/VLC library loading — so the virtualenv is kept on
+# the cloud, which breaks Qt library loading — so the virtualenv is kept on
 # LOCAL disk (Application Support), never inside the synced project folder.
 VENV="$HOME/Library/Application Support/M3UPlayer/venv"
 
@@ -15,9 +15,5 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$VENV/bin/pip" install -r requirements.txt
 fi
 
-# python-vlc normally finds VLC.app on its own. If it can't, uncomment these to
-# point it at the installed engine explicitly:
-# export DYLD_LIBRARY_PATH="/Applications/VLC.app/Contents/MacOS/lib:${DYLD_LIBRARY_PATH:-}"
-# export PYTHON_VLC_LIB_PATH="/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib"
-
+# This is the development entry point. For the standalone bundle see build_app.sh.
 exec "$VENV/bin/python" -m m3u_player.main
