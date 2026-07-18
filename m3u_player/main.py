@@ -383,7 +383,10 @@ class MainWindow(QMainWindow):
         self._active_channel: Channel | None = None
         self._is_casting = False
         self._seek_acc = SeekAccumulator()
-        self._play_mode = "direct"  # "direct" = raw live stream, "dvr" = relay
+        # "raw"  = provider stream direct (bootstrap only, first seconds)
+        # "live" = local relay, open-ended manifest, following live
+        # "dvr"  = local relay, VOD snapshot, rewound and seekable
+        self._play_mode = "raw"
         self._pending_dvr_seek: float | None = None
         self._pause_after_switch = False
         self._live_clock = SmoothedClock()
@@ -680,7 +683,7 @@ class MainWindow(QMainWindow):
             # connect. We only switch onto the DVR relay when you rewind.
             self.player.play(channel.url)
             self._ensure_stream(channel)
-            self._play_mode = "direct"
+            self._play_mode = "raw"
             self._pending_dvr_seek = None
             self._pause_after_switch = False
         except Exception as exc:
@@ -762,8 +765,8 @@ class MainWindow(QMainWindow):
             advancing = not self.cast_manager.is_paused()
             # cast status arrives in bursts; project between pushes so the bar glides
             return self._cast_clock.update(raw, now, advancing=advancing) or 0.0
-        if self._play_mode == "direct":
-            return self._safe_live()  # watching the raw live stream
+        if self._play_mode in ("raw", "live"):
+            return self._safe_live()  # following live; not a seekable timeline
         if self.player is not None:
             # player time is relative to the armed snapshot's first segment
             return self._dvr_origin + self.player.time_s()
@@ -805,17 +808,19 @@ class MainWindow(QMainWindow):
         edge. The handoff costs one seek (~0.2s), and from then on playback is
         reading local disk, which also means rewinding is instant.
         """
-        if (
-            self._play_mode != "direct"
-            or self.player is None
-            or self._recorder is None
-            or self._is_casting
-        ):
-            return
-        start, safe_live, _ = self._stream_extents()
-        if safe_live - start < HANDOFF_MIN_BUFFER:
-            return
-        self._switch_to_dvr(safe_live)
+        # Deliberately does nothing: live playback stays on the raw stream.
+        #
+        # An earlier version handed off to the local relay a few seconds in, on
+        # the theory that the raw connection was unreliable. Measured over three
+        # minutes, the opposite holds: raw playback had *zero* interruptions
+        # (worst frame gap 0.1s), while playing the relay stalled repeatedly for
+        # 8-60s. Neither the manifest window size, the segment-serving cost, nor
+        # the User-Agent explained it — the relay is simply not a good source for
+        # following live, only for seeking within what is already recorded.
+        #
+        # Kept as a named no-op because "why don't we play our own relay, we
+        # already have the segments?" is the obvious idea, and it is wrong.
+        return
 
     def _rearm_dvr(self) -> None:
         """Re-point at a fresher snapshot, preserving position.
@@ -853,8 +858,8 @@ class MainWindow(QMainWindow):
             # starts at the buffer front
             self.cast_manager.seek(t - start)
             return
-        if self._play_mode == "direct":
-            # rewinding for the first time: hop onto the DVR relay at that point
+        if self._play_mode in ("raw", "live"):
+            # rewinding for the first time: hop onto a seekable snapshot
             self._switch_to_dvr(t)
             return
         if self.player is not None:
@@ -879,14 +884,16 @@ class MainWindow(QMainWindow):
         # would drop playback back onto the connection that proved unreliable,
         # and would throw away the buffer we can rewind into.
         #
-        # Re-arm first: the currently armed snapshot was frozen when it was
-        # built, so it does not reach the live edge yet and seeking into it would
-        # land short by however long we have been watching it.
-        if self._recorder is not None and self.player is not None:
-            self._arm_dvr()
-            self._play_mode = "dvr"
-            self._pending_dvr_seek = self._safe_live()
+        # Back onto the raw stream: that is genuinely live and starts
+        # immediately. Seeking to the live edge of the armed snapshot instead
+        # would land short (the snapshot was frozen when built) and leave
+        # playback sitting at its end, re-arming constantly.
+        if self._active_channel is not None and self.player is not None:
+            self.player.play(self._active_channel.url)
+            self._play_mode = "raw"
+            self._pending_dvr_seek = None
             self._pause_after_switch = False
+            self._dvr_origin = 0.0
 
     def _pause_toggle(self) -> None:
         if self._is_casting and self.cast_manager.is_active():
@@ -895,7 +902,7 @@ class MainWindow(QMainWindow):
             else:
                 self.cast_manager.pause()
             return
-        if self._play_mode == "direct":
+        if self._play_mode in ("raw", "live"):
             # Pausing a live stream only works on the DVR copy — hop across at
             # the live point and pause there so resuming continues from here.
             if self._switch_to_dvr(self._safe_live()):
@@ -1197,7 +1204,11 @@ class MainWindow(QMainWindow):
         # session-hashed segments can't be played by the Chromecast directly),
         # and keep the Mac awake so the relay stays alive while casting.
         try:
-            local_url = self._ensure_stream(channel)
+            self._ensure_stream(channel)
+            # Build the URL against an address *this device* can reach us on.
+            # lan_ip() follows the default route, which a VPN owns — handing the
+            # TV a tunnel address means it silently loads nothing.
+            local_url = self.proxy.manifest_url(self.cast_manager.device_host(uuid_str))
         except Exception as exc:
             self._on_cast_failed(f"Couldn't start local relay: {exc}")
             return

@@ -60,6 +60,26 @@ class CastManager:
             for uuid, info in self._browser.devices.items()
         ]
 
+    def device_host(self, uuid_str: str) -> str | None:
+        """The device's own IP, so we can work out which of our addresses it can
+        reach us on. With a VPN up, our default-route address is the tunnel's and
+        is unreachable from the LAN — see ``proxy.lan_ip_for``."""
+        if self._browser is None:
+            return None
+        info = self._browser.devices.get(UUID(uuid_str))
+        if info is None:
+            return None
+        host = getattr(info, "host", None)
+        if host:
+            return host
+        # older pychromecast exposes the address via the mDNS service entry
+        services = getattr(info, "services", None) or []
+        for svc in services:
+            addr = getattr(svc, "address", None)
+            if addr:
+                return addr
+        return None
+
     # ---- casting ------------------------------------------------------ #
     def cast(self, uuid_str: str, url: str, title: str) -> str:
         """Connect to the device and play the URL. Returns the device name.

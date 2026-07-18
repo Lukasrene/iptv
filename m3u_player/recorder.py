@@ -5,6 +5,7 @@ import shutil
 import sys
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,6 +189,14 @@ class Recorder:
         return True
 
     def snapshot(self) -> list[RecordedSeg]:
+        """Current on-disk segments, read fresh from the index every time.
+
+        Do not add a cache here. It is tempting — this is polled by the UI and
+        hit for every proxy request — but ffmpeg deletes segments underneath us,
+        and a cached list keeps handing out paths to files that are already gone.
+        Serving those stalls playback. Measured: a 250ms cache was enough to
+        freeze rewound playback outright.
+        """
         try:
             segs = parse_hls_index(self._index.read_text(), self._dir)
         except OSError:
@@ -230,6 +239,8 @@ class Recorder:
         return snap[-1].duration if snap else self._segment_seconds
 
     def path_for(self, media_seq: int) -> str | None:
+        # Serving a segment must not cost an index re-parse; the file is on disk
+        # under a name we can derive, and the cached snapshot confirms it.
         for s in self.snapshot():
             if s.media_seq == media_seq:
                 return s.path

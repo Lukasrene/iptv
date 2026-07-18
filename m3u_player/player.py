@@ -68,7 +68,14 @@ class Player:
         return max(0.0, self._mp.duration() / 1000.0)
 
     def seek_s(self, t: float) -> None:
+        was_playing = self._mp.playbackState() == QMediaPlayer.PlayingState
         self._mp.setPosition(int(max(0.0, t) * 1000))
+        # Seeking a source that has only just loaded can leave the backend
+        # reporting PlayingState while the position never advances and no frames
+        # arrive. Re-asserting play() after the seek shakes it loose; it is a
+        # no-op when playback really is running.
+        if was_playing:
+            self._mp.play()
 
     def is_seekable(self) -> bool:
         """True only once a closed VOD manifest is loaded — the raw live stream

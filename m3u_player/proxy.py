@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import socket
 import threading
@@ -13,16 +14,30 @@ from m3u_player.recorder import RecordedSeg
 _SEG_RE = re.compile(r"^/seg/(\d+)\.ts$")
 
 
-def lan_ip() -> str:
-    """Best-effort primary LAN IP (so a Chromecast on the network can reach us)."""
+def lan_ip_for(host: str) -> str:
+    """Our source address for reaching ``host``.
+
+    Asking the routing table which local address it would use to talk to a
+    specific peer is the only reliable way to get this. Probing a public address
+    instead (the old behaviour) returns whatever the *default* route uses, and
+    with a VPN up that is the tunnel address — which no device on the LAN can
+    reach, so a Chromecast handed that URL silently fails to load anything.
+    LAN peers stay on the physical interface even when a VPN owns the default
+    route, so asking about the device itself gives the right answer.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.connect((host, 80))
         return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def lan_ip() -> str:
+    """Best-effort primary LAN IP, when no specific peer is known."""
+    return lan_ip_for("8.8.8.8")
 
 
 def _manifest_lines(segments: list[RecordedSeg], local_base: str) -> list[str]:
@@ -41,13 +56,28 @@ def _manifest_lines(segments: list[RecordedSeg], local_base: str) -> list[str]:
     return lines
 
 
-def build_dvr_manifest(segments: list[RecordedSeg], local_base: str) -> str:
-    """Sliding-window *live* manifest — served at ``/live.m3u8`` for the Chromecast.
+LIVE_WINDOW_SEGMENTS = 20
 
-    No ``#EXT-X-ENDLIST``, so the receiver keeps reloading it and follows live.
-    Do not add a playlist type or an endlist here: the cast path depends on this
-    staying an open-ended live playlist.
+
+def build_dvr_manifest(
+    segments: list[RecordedSeg], local_base: str, window: int = LIVE_WINDOW_SEGMENTS
+) -> str:
+    """Sliding-window *live* manifest — ``/live.m3u8``, for the Chromecast and
+    for local playback while following live.
+
+    No ``#EXT-X-ENDLIST``, so the client keeps reloading it and follows live. Do
+    not add a playlist type or an endlist: both consumers depend on this staying
+    an open-ended live playlist.
+
+    Only the newest ``window`` segments are listed, with ``#EXT-X-MEDIA-SEQUENCE``
+    moved up to match. Listing the whole retained hour instead makes this an
+    ever-growing playlist, which is not what a live playlist looks like — Qt's
+    demuxer was measured stalling for >20s on one, and a Chromecast would buffer
+    the entire history before showing anything. Seeking further back is what
+    ``/dvr.m3u8`` is for.
     """
+    if window > 0:
+        segments = segments[-window:]
     return "\n".join(_manifest_lines(segments, local_base)) + "\n"
 
 
@@ -85,6 +115,7 @@ class HlsProxy:
         self._thread: threading.Thread | None = None
         self._base: str | None = None        # LAN address, for the Chromecast
         self._local_base: str | None = None  # loopback, for local playback
+        self._port = 0
         self._recorder = None
 
     def attach_recorder(self, recorder) -> None:
@@ -94,10 +125,30 @@ class HlsProxy:
     def base_url(self) -> str | None:
         return self._base
 
-    def manifest_url(self) -> str:
-        """Open-ended live manifest on the LAN address — for the Chromecast,
-        which has to reach this machine over the network."""
-        return f"{self._base}/live.m3u8"
+    def manifest_url(self, client_host: str | None = None) -> str:
+        """Open-ended live manifest for the Chromecast, on an address the device
+        can actually reach.
+
+        ``client_host`` is the device's own IP. The source address for reaching
+        it is what the device must call back on — which is *not* the default
+        route when a VPN is up: the tunnel's address is unreachable from the LAN.
+        """
+        host = lan_ip_for(client_host) if client_host else lan_ip()
+        port = self._server.server_address[1] if self._server else 0
+        return f"http://{host}:{port}/live.m3u8"
+
+    def live_url(self) -> str:
+        """Open-ended live manifest on loopback — for local playback at the live
+        edge.
+
+        Playing live must not use the VOD snapshot: a snapshot ends a few seconds
+        past the live edge, so playback would reach the end and need re-arming
+        almost immediately, and every re-arm is a visible reload. An open-ended
+        playlist is one Qt keeps reloading by itself, so live playback runs
+        uninterrupted. It just cannot be seeked — which is what ``/dvr.m3u8`` is
+        for, once the viewer rewinds.
+        """
+        return f"{self._local_base}/live.m3u8"
 
     def dvr_url(self) -> str:
         """Closed VOD snapshot on the loopback address — for the local player.
@@ -125,8 +176,15 @@ class HlsProxy:
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path == "/live.m3u8":
-                    # cast: segments must be reachable over the LAN
-                    proxy._serve_manifest(self, build_dvr_manifest, proxy._base)
+                    # Segment URLs must be reachable *from whoever asked*. A
+                    # Chromecast needs our LAN address; local playback asked
+                    # over loopback and should stay there.
+                    client = self.client_address[0]
+                    if client.startswith("127."):
+                        base = proxy._local_base
+                    else:
+                        base = f"http://{lan_ip_for(client)}:{proxy._port}"
+                    proxy._serve_manifest(self, build_dvr_manifest, base)
                     return
                 if path == "/dvr.m3u8":
                     # local: keep the whole chain on loopback
@@ -139,7 +197,7 @@ class HlsProxy:
                 self.send_error(404)
 
         self._server = ThreadingHTTPServer(("", 0), Handler)
-        port = self._server.server_address[1]
+        port = self._port = self._server.server_address[1]
         self._base = f"http://{lan_ip()}:{port}"
         self._local_base = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -162,19 +220,55 @@ class HlsProxy:
             pass
 
     def _serve_segment(self, h: BaseHTTPRequestHandler, media_seq: int) -> None:
+        """Serve one recorded segment, honouring ``Range``.
+
+        Range support is not optional here: ffmpeg's HTTP client issues range
+        requests when seeking inside a segment, and answering every one with a
+        full ``200`` leaves the demuxer's byte offsets disagreeing with what it
+        actually received — playback then stalls after a seek while still
+        reporting itself as playing. Segments are several MB, so serving the
+        whole thing repeatedly is wasteful besides.
+        """
         path = self._recorder.path_for(media_seq) if self._recorder else None
         if not path:
             h.send_error(404)
             return
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            size = os.path.getsize(path)
         except OSError:
             h.send_error(404)
             return
-        h.send_response(200)
+
+        start, end = 0, size - 1
+        rng = h.headers.get("Range")
+        partial = False
+        if rng:
+            m = re.match(r"bytes=(\d*)-(\d*)", rng.strip())
+            if m:
+                lo, hi = m.group(1), m.group(2)
+                if lo:
+                    start = min(int(lo), max(0, size - 1))
+                    end = int(hi) if hi else size - 1
+                elif hi:  # suffix range: last N bytes
+                    start = max(0, size - int(hi))
+                end = min(end, size - 1)
+                partial = True
+
+        length = max(0, end - start + 1)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                data = f.read(length)
+        except OSError:
+            h.send_error(404)
+            return
+
+        h.send_response(206 if partial else 200)
         h.send_header("Content-Type", "video/mp2t")
         h.send_header("Content-Length", str(len(data)))
+        h.send_header("Accept-Ranges", "bytes")
+        if partial:
+            h.send_header("Content-Range", f"bytes {start}-{start + len(data) - 1}/{size}")
         h.send_header("Access-Control-Allow-Origin", "*")
         h.end_headers()
         try:

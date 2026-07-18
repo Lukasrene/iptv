@@ -77,3 +77,33 @@ def test_live_manifest_stays_open_ended():
     """Regression guard: the cast path must not acquire an ENDLIST."""
     assert "#EXT-X-ENDLIST" not in build_dvr_manifest(SEGS, BASE)
     assert "#EXT-X-PLAYLIST-TYPE" not in build_dvr_manifest(SEGS, BASE)
+
+
+# --------------------------------------------------------------------------- #
+# The live manifest is a sliding window, not the whole retained buffer.
+# --------------------------------------------------------------------------- #
+MANY = [RecordedSeg(700 + n, f"/tmp/{n}.ts", 2.0) for n in range(50)]
+
+
+def test_live_manifest_lists_only_the_newest_segments():
+    out = build_dvr_manifest(MANY, BASE, window=20)
+    assert out.count("#EXTINF:") == 20
+    assert f"{BASE}/seg/749.ts" in out       # newest present
+    assert f"{BASE}/seg/700.ts" not in out   # oldest dropped
+
+
+def test_live_manifest_media_sequence_follows_the_window():
+    out = build_dvr_manifest(MANY, BASE, window=20)
+    assert "#EXT-X-MEDIA-SEQUENCE:730" in out
+
+
+def test_live_manifest_shorter_than_window_lists_everything():
+    out = build_dvr_manifest(SEGS, BASE, window=20)
+    assert out.count("#EXTINF:") == 3
+
+
+def test_vod_manifest_still_lists_the_whole_buffer():
+    """The seekable snapshot must not be windowed — that is the DVR depth."""
+    out = build_vod_manifest(MANY, BASE)
+    assert out.count("#EXTINF:") == 50
+    assert f"{BASE}/seg/700.ts" in out
