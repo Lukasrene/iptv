@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QEvent,
     QModelIndex,
     Qt,
     QThread,
@@ -315,6 +316,8 @@ class ControlOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # must never take focus, or it would swallow the playback shortcuts
+        self.setFocusPolicy(Qt.NoFocus)
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(12, 6, 12, 12)
         self._lay.setSpacing(8)
@@ -498,6 +501,10 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._apply_search)
 
+        # panel navigation keys (see eventFilter)
+        self.group_list.installEventFilter(self)
+        self.channel_view.installEventFilter(self)
+
         # DVR position polling (updates the timeline from the active target)
         self._pos_timer = QTimer(self)
         self._pos_timer.setInterval(250)  # smooth motion rather than 1s ticks
@@ -665,7 +672,6 @@ class MainWindow(QMainWindow):
             self._play_mode = "direct"
             self._pending_dvr_seek = None
             self._pause_after_switch = False
-            self.video_frame.setFocus()  # shortcuts active straight away
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
@@ -895,6 +901,10 @@ class MainWindow(QMainWindow):
             self._overlay.adjustSize()  # after show, so children report real sizes
             self._place_overlay()
             self._overlay.raise_()
+            # keep the keyboard with the main window (the overlay is a separate
+            # top-level window); no lists on screen, so arrows should seek
+            self.activateWindow()
+            self.video_frame.setFocus()
             self._is_fullscreen = True
         else:
             self._overlay_pos = self._overlay.pos()
@@ -925,6 +935,43 @@ class MainWindow(QMainWindow):
 
     def _nudge_volume(self, delta: int) -> None:
         self.volume.setValue(max(0, min(100, self.volume.value() + delta)))
+
+    def _focus_channels(self) -> None:
+        """Move into the channel list, selecting the first row if nothing is."""
+        self.channel_view.setFocus()
+        if not self.channel_view.currentIndex().isValid() and self.channel_model.rowCount():
+            self.channel_view.setCurrentIndex(self.channel_model.index(0))
+
+    def eventFilter(self, obj, event):
+        """Keys while browsing the panels.
+
+        Up/Down keep their normal list navigation; Left/Right move between the
+        groups and channels panels (rather than seeking, which is what they do
+        while watching); Enter starts the selected channel. Space and F are
+        handled here too so they don't get eaten by the list's type-ahead.
+        """
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            enter = (Qt.Key_Return, Qt.Key_Enter)
+            if obj is self.group_list:
+                if key == Qt.Key_Right or key in enter:
+                    self._focus_channels()
+                    return True
+            elif obj is self.channel_view:
+                if key == Qt.Key_Left:
+                    self.group_list.setFocus()
+                    return True
+                if key in enter:
+                    self._play(self._selected_channel())
+                    return True
+            if obj in (self.group_list, self.channel_view):
+                if key == Qt.Key_Space:
+                    self._pause_toggle()
+                    return True
+                if key == Qt.Key_F:
+                    self._toggle_fullscreen()
+                    return True
+        return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event) -> None:
         # Never hijack typing — the search box keeps every keystroke.

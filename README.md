@@ -67,6 +67,22 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
 
 ### Keyboard shortcuts
 
+Arrow keys are context-sensitive: they **browse** while you're in the panels and
+**control playback** while you're watching.
+
+**While browsing the panels**
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move through the list |
+| `→` | Groups → channels |
+| `←` | Channels → groups |
+| `Enter` | Play the selected channel |
+| `Space` | Play / pause |
+| `F` | Fullscreen |
+
+**While watching** (click the video, or go fullscreen)
+
 | Key | Action |
 | --- | --- |
 | `Space` | Play / pause |
@@ -75,9 +91,7 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
 | `F` | Toggle fullscreen |
 | `Esc` | Leave fullscreen |
 
-Shortcuts are ignored while you're typing in the search box. If the channel list
-has focus, `↑`/`↓` browse the list as usual — click the video to hand keyboard
-control back to playback (starting a channel does this automatically).
+Shortcuts are ignored while you're typing in the search box.
 - **Refresh** (toolbar) re-fetches a URL playlist to pick up new channels and
   refreshed access tokens.
 
