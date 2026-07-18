@@ -1,5 +1,6 @@
 from m3u_player.transport import (
     SeekAccumulator,
+    SmoothedClock,
     clamp_seek,
     fmt_hms,
     hover_label,
@@ -64,3 +65,41 @@ def test_seek_accumulator_resumes_from_current_after_commit():
     acc.add(-5, current=100, lo=0, hi=3600)
     acc.take()
     assert acc.add(-5, current=80, lo=0, hi=3600) == 75
+
+
+# --- SmoothedClock: keeps "behind live" steady between 10s segment arrivals --- #
+
+
+def test_clock_advances_smoothly_between_segment_arrivals():
+    c = SmoothedClock()
+    assert c.update(100, now=0) == 100
+    # buffer length hasn't changed yet, but wall time moved: edge advances anyway
+    assert c.update(100, now=1) == 101
+    assert c.update(100, now=5) == 105
+
+
+def test_clock_catches_up_when_measurement_jumps_ahead():
+    c = SmoothedClock()
+    c.update(100, now=0)
+    c.update(100, now=9)  # projected 109
+    assert c.update(112, now=9.5) == 112
+
+
+def test_clock_resyncs_down_after_long_stall():
+    c = SmoothedClock(resync_threshold=20)
+    c.update(100, now=0)
+    # nothing recorded for 30s -> projection is way ahead, snap back to reality
+    assert c.update(100, now=30) == 100
+
+
+def test_clock_holds_while_paused():
+    c = SmoothedClock()
+    c.update(50, now=0)
+    assert c.update(50, now=3, advancing=False) == 50
+
+
+def test_clock_reset():
+    c = SmoothedClock()
+    c.update(100, now=0)
+    c.reset()
+    assert c.update(5, now=99) == 5
