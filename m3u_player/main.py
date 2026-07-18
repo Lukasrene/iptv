@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QVBoxLayout,
@@ -45,6 +46,7 @@ from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
 from m3u_player.thumbnails import Thumbnailer
 from m3u_player.transport import (
+    LIVE_EPSILON,
     LIVE_MARGIN,
     SeekAccumulator,
     SmoothedClock,
@@ -312,21 +314,26 @@ class ControlOverlay(QWidget):
         super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self._lay = QVBoxLayout(self)
-        self._lay.setContentsMargins(10, 6, 10, 10)
-        self._lay.setSpacing(6)
-        grip = QLabel("⠿  drag to move")
-        grip.setAlignment(Qt.AlignCenter)
-        grip.setStyleSheet("color:#bbb; font-size:11px;")
+        self._lay.setContentsMargins(12, 6, 12, 12)
+        self._lay.setSpacing(8)
+        self._grip = QLabel("⠿  drag to move")
+        self._grip.setAlignment(Qt.AlignCenter)
+        self._grip.setStyleSheet("color:#bbb; font-size:11px;")
+        self._grip.setFixedHeight(16)  # own row — never overlaps the timeline
+        self._grip.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         # let clicks on the grip fall through so they start a drag
-        grip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._lay.addWidget(grip)
+        self._grip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._lay.addWidget(self._grip, 0)
         self._drag_off = None
+        self.setMinimumWidth(620)
         self.setStyleSheet("background: rgba(24,24,24,228); border-radius:10px;")
 
     def adopt(self, *widgets) -> None:
         for w in widgets:
-            self._lay.addWidget(w)
+            self._lay.addWidget(w, 0)
             w.show()
+        self._lay.activate()
+        self.adjustSize()
 
     def mousePressEvent(self, event) -> None:
         self._drag_off = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -658,49 +665,61 @@ class MainWindow(QMainWindow):
             self.player.set_volume(value)
 
     # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
-    def _target_position_length(self) -> tuple[float, float]:
-        """Return (position, live_edge) in seconds, both smoothed.
+    def _stream_extents(self) -> tuple[float, float, float]:
+        """Return (raw_window, safe_live, display_live) in seconds.
 
-        The live edge sits LIVE_MARGIN behind the newest buffered content so
-        there's always runway ahead, and is projected with wall-clock time so
-        "behind live" stays steady instead of ticking down between segments.
+        ``safe_live`` is the furthest position that is actually *playable*: the
+        start of the newest complete segment, so there is a full segment of
+        runway before the next one arrives. That is the minimum safe margin —
+        going closer to the edge starves the player, because content only
+        arrives one segment at a time.
+
+        ``display_live`` is ``safe_live`` projected with wall-clock time, used
+        only for the steady "behind live" readout. It must never be used as a
+        seek target: it runs ahead of what has actually been downloaded.
         """
         now = time.monotonic()
-        raw_window = 0.0
-        if self._recorder is not None:
-            raw_window = sum(s.duration for s in self._recorder.snapshot())
-        measured_edge = max(0.0, raw_window - LIVE_MARGIN)
-        live_edge = self._live_clock.update(measured_edge, now) or 0.0
+        snap = self._recorder.snapshot() if self._recorder is not None else []
+        raw_window = sum(s.duration for s in snap)
+        # one segment of runway — as close to live as we can safely sit
+        margin = snap[-1].duration if snap else LIVE_MARGIN
+        safe_live = max(0.0, raw_window - margin)
+        display_live = self._live_clock.update(safe_live, now) or 0.0
+        return raw_window, safe_live, display_live
 
+    def _current_position(self) -> float:
+        now = time.monotonic()
         if self._is_casting and self.cast_manager.is_active():
             raw = self.cast_manager.current_time()
             advancing = not self.cast_manager.is_paused()
             # cast status arrives in bursts; project between pushes so the bar glides
-            pos = self._cast_clock.update(raw, now, advancing=advancing) or 0.0
-        elif self.player is not None:
-            pos = self.player.time_s()
-        else:
-            pos = 0.0
-        return pos, live_edge
+            return self._cast_clock.update(raw, now, advancing=advancing) or 0.0
+        if self.player is not None:
+            return self.player.time_s()
+        return 0.0
+
+    def _target_position_length(self) -> tuple[float, float]:
+        """(position, display live edge) — for the readout only."""
+        _, _, display_live = self._stream_extents()
+        return self._current_position(), display_live
 
     def _seek_to(self, t: float) -> None:
-        _, window = self._target_position_length()
-        t = clamp_seek(t, 0.0, max(0.0, window))
+        # Clamp to what is actually downloaded — never the projected edge, or the
+        # player waits for content that does not exist yet.
+        _, safe_live, _ = self._stream_extents()
+        t = clamp_seek(t, 0.0, safe_live)
         if self._is_casting and self.cast_manager.is_active():
             self.cast_manager.seek(t)
         elif self.player is not None:
             self.player.seek_s(t)
 
     def _seek_relative(self, delta: float) -> None:
-        pos, _ = self._target_position_length()
-        self._seek_to(pos + delta)
+        self._seek_to(self._current_position() + delta)
 
     def _seek_live(self) -> None:
-        # live_edge already sits LIVE_MARGIN back from the newest content, so
-        # there's buffered runway ahead and playback resumes immediately.
-        _, live_edge = self._target_position_length()
+        _, safe_live, _ = self._stream_extents()
         self._seek_acc.take()  # cancel any pending stacked step
-        self._seek_to(live_edge)
+        self._seek_to(safe_live)
 
     def _pause_toggle(self) -> None:
         if self._is_casting and self.cast_manager.is_active():
@@ -713,13 +732,19 @@ class MainWindow(QMainWindow):
 
     def _seek_step(self, delta: float) -> None:
         # Coalesce rapid presses: stack onto the pending target and fire once.
-        pos, window = self._target_position_length()
-        target = self._seek_acc.add(delta, pos, 0.0, max(0.0, window))
-        self._window_seconds = window
-        if window > 0:
-            self.timeline.setValue(int(min(1.0, target / window) * 1000))
-            self.behind_live_label.setText(hover_label(target, window))
+        _, safe_live, display_live = self._stream_extents()
+        target = self._seek_acc.add(delta, self._current_position(), 0.0, safe_live)
+        self._window_seconds = safe_live
+        if safe_live > 0:
+            self.timeline.setValue(int(min(1.0, target / safe_live) * 1000))
+            self.behind_live_label.setText(self._behind_text(target, safe_live, display_live))
         self._seek_commit_timer.start()
+
+    def _behind_text(self, pos: float, safe_live: float, display_live: float) -> str:
+        """Steady 'behind live' readout, showing LIVE at the live edge."""
+        if pos >= safe_live - LIVE_EPSILON:
+            return "LIVE"
+        return hover_label(pos, display_live)
 
     def _commit_seek(self) -> None:
         target = self._seek_acc.take()
@@ -730,12 +755,15 @@ class MainWindow(QMainWindow):
         self._seek_to(fraction * self._window_seconds)
 
     def _on_timeline_hover(self, fraction: float, global_pos) -> None:
-        window = self._window_seconds
-        if window <= 0:
+        _, safe_live, display_live = self._stream_extents()
+        if safe_live <= 0:
             return
-        hovered = fraction * window
-        pos, _ = self._target_position_length()
-        text = f"{signed_delta_label(hovered, pos)}   ({hover_label(hovered, window)})"
+        hovered = fraction * safe_live
+        pos = self._current_position()
+        text = (
+            f"{signed_delta_label(hovered, pos)}   "
+            f"({self._behind_text(hovered, safe_live, display_live)})"
+        )
         pixmap = None
         if self._thumbnailer is not None:
             path = self._thumbnailer.thumbnail_for_offset(hovered)
@@ -752,13 +780,14 @@ class MainWindow(QMainWindow):
         if not active:
             self.behind_live_label.setText("")
             return
-        pos, window = self._target_position_length()
-        self._window_seconds = window
+        _, safe_live, display_live = self._stream_extents()
+        pos = self._current_position()
+        self._window_seconds = safe_live
         # don't fight an active drag or a pending coalesced seek
-        if window > 0 and not self.timeline.isSliderDown() and not self._seek_acc.pending:
-            self.timeline.setValue(int(min(1.0, pos / window) * 1000))
-            self.behind_live_label.setText(hover_label(pos, window))
-        elif window <= 0:
+        if safe_live > 0 and not self.timeline.isSliderDown() and not self._seek_acc.pending:
+            self.timeline.setValue(int(min(1.0, pos / safe_live) * 1000))
+            self.behind_live_label.setText(self._behind_text(pos, safe_live, display_live))
+        elif safe_live <= 0:
             self.behind_live_label.setText("buffering…")
         paused = (
             self.cast_manager.is_paused()
@@ -779,9 +808,9 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
             # transport follows you into fullscreen as a draggable overlay
             self._overlay.adopt(self.timeline_widget, self.controls_widget)
-            self._overlay.adjustSize()
-            self._place_overlay()
             self._overlay.show()
+            self._overlay.adjustSize()  # after show, so children report real sizes
+            self._place_overlay()
             self._overlay.raise_()
             self._is_fullscreen = True
         else:
