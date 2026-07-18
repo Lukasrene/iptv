@@ -1,4 +1,10 @@
-from m3u_player.transport import clamp_seek, fmt_hms, hover_label
+from m3u_player.transport import (
+    SeekAccumulator,
+    clamp_seek,
+    fmt_hms,
+    hover_label,
+    signed_delta_label,
+)
 
 
 def test_fmt_hms_minutes_seconds():
@@ -27,3 +33,34 @@ def test_clamp_seek_within_bounds():
     assert clamp_seek(50, 0, 120) == 50
     assert clamp_seek(-10, 0, 120) == 0
     assert clamp_seek(999, 0, 120) == 120
+
+
+def test_signed_delta_label():
+    assert signed_delta_label(90, 90) == "±0:00"
+    assert signed_delta_label(60, 90) == "−0:30"
+    assert signed_delta_label(120, 90) == "+0:30"
+
+
+def test_seek_accumulator_stacks_rapid_presses():
+    acc = SeekAccumulator()
+    assert acc.add(-5, current=100, lo=0, hi=3600) == 95
+    # subsequent presses stack on the pending target, ignoring the (lagging) current
+    assert acc.add(-5, current=100, lo=0, hi=3600) == 90
+    assert acc.add(-5, current=100, lo=0, hi=3600) == 85
+    assert acc.pending is True
+    assert acc.take() == 85
+    assert acc.pending is False
+
+
+def test_seek_accumulator_clamps_to_window():
+    acc = SeekAccumulator()
+    assert acc.add(-5, current=3, lo=0, hi=3600) == 0
+    acc.take()
+    assert acc.add(10, current=3595, lo=0, hi=3600) == 3600
+
+
+def test_seek_accumulator_resumes_from_current_after_commit():
+    acc = SeekAccumulator()
+    acc.add(-5, current=100, lo=0, hi=3600)
+    acc.take()
+    assert acc.add(-5, current=80, lo=0, hi=3600) == 75
