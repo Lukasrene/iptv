@@ -7,27 +7,39 @@ list, favorite channels, and watch the selected stream in an embedded video pane
 Built for large IPTV exports (tested against a ~26,000-channel, 700+ group
 playlist of MPEG-TS live streams).
 
+## Install
+
+Download or build `M3U Player.app`, drag it to your Applications folder, and open
+it. Nothing else is required — the app carries its own copy of everything it
+needs, including the video engine. You do **not** need VLC, Python, or ffmpeg
+installed.
+
+> The app is unsigned, so the very first launch needs **right-click → Open**
+> rather than a double-click. macOS then remembers the choice.
+
+To build it yourself:
+
+```bash
+./build_app.sh          # produces dist/M3U Player.app
+```
+
 ## Requirements
 
-- macOS
-- **[VLC](https://www.videolan.org/vlc/) installed** in `/Applications` — the app
-  uses VLC's engine to decode the streams. (These `.ts` MPEG-TS streams can't be
-  played by a browser or QuickTime.)
-- Python 3.9+
+- macOS 11 or later
 
-## Setup & Run
+Only for working on the code: Python 3.9+.
 
-Just run it — the script sets up its environment automatically on first launch:
+## Running from source
+
+For development, run it straight from the repo — the script sets up its
+environment on first launch:
 
 ```bash
 ./run.sh
 ```
 
-The first run creates a Python virtualenv and installs the dependencies; later
-runs skip straight to launching.
-
 > **Where the virtualenv lives:** this repo may sit in an iCloud-synced folder,
-> and iCloud evicts binary files (like the Qt and VLC libraries) to the cloud,
+> and iCloud evicts binary files (like the Qt libraries) to the cloud,
 > which breaks the app with cryptic library-loading errors. So the environment is
 > created on **local disk** at `~/Library/Application Support/M3UPlayer/venv`,
 > never inside the synced repo. `run.sh` handles this automatically.

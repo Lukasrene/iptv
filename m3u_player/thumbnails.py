@@ -5,7 +5,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-import imageio_ffmpeg
+from m3u_player.recorder import ffmpeg_exe
 
 
 class Thumbnailer:
@@ -22,7 +22,7 @@ class Thumbnailer:
         self._out.mkdir(parents=True, exist_ok=True)
         self._recorder = recorder
         self._width = width
-        self._ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        self._ffmpeg = ffmpeg_exe()
         self._done: dict[int, str] = {}  # media_seq -> jpg path
         self._lock = threading.Lock()
         self._stop = threading.Event()

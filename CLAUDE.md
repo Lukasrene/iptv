@@ -1,6 +1,6 @@
 # CLAUDE.md — working notes for this repo
 
-macOS desktop IPTV/M3U player (Python + PySide6 + VLC) with a DVR buffer,
+macOS desktop IPTV/M3U player (Python + PySide6) with a DVR buffer,
 Chromecast support, and keyboard control. Read this before changing anything —
 several decisions here are counter-intuitive and were arrived at by measurement.
 
@@ -14,12 +14,17 @@ The virtualenv deliberately lives **outside the repo**:
 ```
 
 Do **not** put a `.venv` inside a folder that syncs to iCloud Drive — iCloud
-evicts binary files to the cloud and Qt/VLC then fail to load with misleading
+evicts binary files to the cloud and Qt then fails to load with misleading
 errors ("Could not find the Qt platform plugin"). Keep this project on local
 disk. `run.sh` bootstraps the venv on first run.
 
-Requires **VLC.app** installed (python-vlc uses its engine). `imageio-ffmpeg`
-supplies a bundled ffmpeg — no system install needed.
+**No external installs.** The media engine is Qt Multimedia's FFmpeg backend,
+which ships inside the PySide6 wheel; `imageio-ffmpeg` supplies the ffmpeg binary
+the recorder shells out to. `./build_app.sh` packages the lot into a standalone
+`M3U Player.app` (see `packaging/M3UPlayer.spec`).
+
+VLC was removed — do not reintroduce `python-vlc`. Qt's backend measured faster
+on both numbers that matter (first frame 3.4s → ~2s, DVR seek ~3s → 0.23s).
 
 ## Architecture
 
@@ -33,7 +38,7 @@ supplies a bundled ffmpeg — no system install needed.
 | `thumbnails.py` | Extracts one preview frame per segment for timeline hover. |
 | `caster.py` | Google Cast (pychromecast) discovery + playback. No Qt. |
 | `transport.py` | Pure helpers: `SmoothedClock`, `SeekAccumulator`, labels, clamping. |
-| `player.py` | Thin python-vlc wrapper. |
+| `player.py` | Thin `QMediaPlayer` wrapper. Forces the FFmpeg backend. |
 | `main.py` | Qt UI wiring everything together. |
 
 Pure logic (`playlist`, `store`, `source`, `transport`, `recorder.parse_hls_index`,
@@ -44,7 +49,8 @@ driving them against the real stream — see "Verification" below.
 
 **Provider quirks**
 - Requests need a **VLC `User-Agent`**, or the provider resets the connection
-  (`error 54`).
+  (`error 54`). `recorder._UA` is therefore *not* a leftover VLC dependency —
+  it is a string the provider demands. Do not "clean it up".
 - The provider's HLS manifest **302-redirects to an edge host**, and its segment
   URLs are relative with a **session hash** valid only against that host. A
   Chromecast can't follow this, which is why casting goes through our local relay.
@@ -55,6 +61,41 @@ live edge of *their* segments stalls >25s. `recorder.py` therefore runs ffmpeg
 (`-c copy`, no transcode) over the **raw** `.ts` stream to produce short
 segments, which cuts the live margin to a few seconds. Measured: seek near live
 went from >25s to ~3s.
+
+**Why local playback is loopback-only.** `proxy.manifest_url()` (LAN address)
+is for the **Chromecast**, which has to reach this machine over the network.
+`proxy.dvr_url()` is loopback, for local playback. Do not merge them: routing
+local playback over the LAN address makes it hostage to the network, and a VPN
+coming up moves `lan_ip()` to an address that is not locally reachable, which
+stalls playback. Provider traffic still follows the OS routing table, so it goes
+through a VPN as normal.
+
+**Why there are two manifests.** Qt's FFmpeg demuxer reports `duration=0` and
+refuses to seek an open-ended live playlist (an `EVENT` type claims to be
+seekable but still reports no duration). Only a closed VOD playlist gives a real
+duration and working seeks. So `/dvr.m3u8` is a closed VOD **snapshot** for local
+seeking, while `/live.m3u8` stays open-ended for the Chromecast. A snapshot is
+frozen when built, so playback behind live re-arms against a fresher one as it
+nears the end (`_rearm_dvr`).
+
+**Why DVR positions are absolute.** ffmpeg's rolling window deletes segments off
+the front. Measuring position as an offset into the *current* buffer slid the
+whole timeline under the viewer whenever that happened, so positions are anchored
+on `media_seq` via `Recorder.evicted_seconds()`.
+
+**Why the raw stream is only a bootstrap.** `_play()` starts on `channel.url` for
+a fast first frame (~2s vs several seconds waiting for segments), but hands off
+to the local relay once the buffer can carry it (`_maybe_handoff_to_dvr`). The
+raw connection was measured dying after ~30s while the recorder read the same
+source indefinitely — so it is not a good bet for sustained playback, and the
+relay makes rewinding instant anyway. `Live ⏭` seeks to the buffer's live edge
+rather than reopening the raw stream.
+
+**Why the recorder self-heals.** The upstream connection drops for reasons
+outside the app (VPN reconnect, provider reset). `restart_if_dead()` relaunches
+ffmpeg; `append_list` means the buffer and its media sequence survive. ffmpeg's
+stderr is captured (`last_error()`) — it used to go to `/dev/null`, which made a
+dead recorder indistinguishable from a slow one.
 
 **Why playback starts on the raw stream.** Waiting for the DVR buffer's first
 segments cost ~11.5s before any picture. `_play()` now plays `channel.url`
@@ -79,7 +120,7 @@ watching. The fullscreen overlay is a separate top-level window and must stay
 
 Unit tests don't cover playback. For anything touching streaming, verify against
 the real playlist (`~/Desktop/tv-scratchpad-files/playlist.m3u`) by driving
-`Recorder`/`HlsProxy`/VLC headlessly and measuring — that's how every perf claim
+`Recorder`/`HlsProxy`/`Player` headlessly and measuring — that's how every perf claim
 above was established. For Qt, run offscreen:
 
 ```python

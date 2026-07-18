@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 import subprocess
 import threading
 from collections import deque
@@ -11,6 +12,27 @@ from pathlib import Path
 import imageio_ffmpeg
 
 _UA = "VLC/3.0.20 LibVLC/3.0.20"
+
+
+def ffmpeg_exe() -> str:
+    """Path to the ffmpeg binary, in development and inside the .app bundle.
+
+    ``imageio_ffmpeg.get_ffmpeg_exe()`` resolves against the installed wheel's
+    layout, which does not survive packaging. PyInstaller unpacks the bundled
+    copy under ``sys._MEIPASS`` instead, so look there first.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        for name in ("ffmpeg", "ffmpeg-macos-aarch64-v7.1", "ffmpeg-macos-x86_64-v7.1"):
+            candidate = Path(base) / "imageio_ffmpeg" / "binaries" / name
+            if candidate.exists():
+                return str(candidate)
+        found = sorted((Path(base) / "imageio_ffmpeg" / "binaries").glob("ffmpeg*"))
+        if found:
+            return str(found[0])
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
 _INF_RE = re.compile(r"#EXTINF:([\d.]+)")
 _SEQ_RE = re.compile(r"seg_(\d+)\.ts")
 
@@ -109,7 +131,7 @@ class Recorder:
     def start(self) -> None:
         if self._proc is not None:
             return
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg = ffmpeg_exe()
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
             "-user_agent", _UA,
