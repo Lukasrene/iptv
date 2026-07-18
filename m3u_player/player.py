@@ -14,7 +14,12 @@ class Player:
     """
 
     def __init__(self):
-        self._instance = vlc.Instance("--no-xlib", "--quiet")
+        # Segments come from the local DVR relay, so a large network cache only
+        # adds latency after every seek. A small cache makes seeking and
+        # "jump to live" feel immediate.
+        self._instance = vlc.Instance(
+            "--no-xlib", "--quiet", "--network-caching=500", "--live-caching=500"
+        )
         self._mp = self._instance.media_player_new()
 
     def bind_window(self, widget) -> None:

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 import subprocess
+import time
 from uuid import uuid4
 
 from m3u_player.caster import CastManager
@@ -44,7 +45,9 @@ from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
 from m3u_player.thumbnails import Thumbnailer
 from m3u_player.transport import (
+    LIVE_MARGIN,
     SeekAccumulator,
+    SmoothedClock,
     clamp_seek,
     hover_label,
     signed_delta_label,
@@ -297,6 +300,45 @@ class HoverPreview(QWidget):
         self.show()
 
 
+class ControlOverlay(QWidget):
+    """Floating, draggable transport controls shown over the video in fullscreen.
+
+    It's a top-level frameless window so it reliably paints above VLC's native
+    video surface — a plain child widget can be obscured by the native view on
+    macOS. Drag it anywhere by its grip or background.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(10, 6, 10, 10)
+        self._lay.setSpacing(6)
+        grip = QLabel("⠿  drag to move")
+        grip.setAlignment(Qt.AlignCenter)
+        grip.setStyleSheet("color:#bbb; font-size:11px;")
+        # let clicks on the grip fall through so they start a drag
+        grip.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._lay.addWidget(grip)
+        self._drag_off = None
+        self.setStyleSheet("background: rgba(24,24,24,228); border-radius:10px;")
+
+    def adopt(self, *widgets) -> None:
+        for w in widgets:
+            self._lay.addWidget(w)
+            w.show()
+
+    def mousePressEvent(self, event) -> None:
+        self._drag_off = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_off is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_off)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_off = None
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -319,6 +361,9 @@ class MainWindow(QMainWindow):
         self._active_channel: Channel | None = None
         self._is_casting = False
         self._seek_acc = SeekAccumulator()
+        self._live_clock = SmoothedClock()
+        self._cast_clock = SmoothedClock(resync_threshold=4.0)
+        self._overlay_pos = None  # remembered fullscreen control position
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -385,7 +430,8 @@ class MainWindow(QMainWindow):
         self.controls_widget = QWidget()
         controls = QHBoxLayout(self.controls_widget)
         controls.setContentsMargins(0, 0, 0, 0)
-        live_btn = QPushButton("⏮ Live")
+        live_btn = QPushButton("Live ⏭")
+        live_btn.setToolTip("Jump forward to the live edge")
         live_btn.clicked.connect(self._seek_live)
         back5_btn = QPushButton("−5s")
         back5_btn.clicked.connect(lambda: self._seek_step(-5))
@@ -417,14 +463,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("Ready")
 
-        # widgets hidden when the video goes fullscreen
-        self._chrome = [
-            self.group_list,
-            middle,
-            self.now_playing,
-            self.timeline_widget,
-            self.controls_widget,
-        ]
+        # In fullscreen these are hidden; the transport moves to a floating
+        # overlay instead of disappearing.
+        self._chrome = [self.group_list, middle, self.now_playing]
+        self._right_layout = rlayout
+        self._overlay = ControlOverlay(self)
+        self._overlay.hide()
 
         # search debounce
         self._search_timer = QTimer(self)
@@ -434,7 +478,7 @@ class MainWindow(QMainWindow):
 
         # DVR position polling (updates the timeline from the active target)
         self._pos_timer = QTimer(self)
-        self._pos_timer.setInterval(1000)
+        self._pos_timer.setInterval(250)  # smooth motion rather than 1s ticks
         self._pos_timer.timeout.connect(self._update_timeline)
         self._pos_timer.start()
         self._window_seconds = 0.0  # current buffered window length
@@ -564,6 +608,8 @@ class MainWindow(QMainWindow):
         self.proxy.start()
         self._thumbnailer = Thumbnailer(dvr_dir / "thumbs", self._recorder)
         self._thumbnailer.start()
+        self._live_clock.reset()
+        self._cast_clock.reset()
         self._active_channel = channel
         return self.proxy.manifest_url()
 
@@ -613,16 +659,29 @@ class MainWindow(QMainWindow):
 
     # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
     def _target_position_length(self) -> tuple[float, float]:
-        window = 0.0
+        """Return (position, live_edge) in seconds, both smoothed.
+
+        The live edge sits LIVE_MARGIN behind the newest buffered content so
+        there's always runway ahead, and is projected with wall-clock time so
+        "behind live" stays steady instead of ticking down between segments.
+        """
+        now = time.monotonic()
+        raw_window = 0.0
         if self._recorder is not None:
-            window = sum(s.duration for s in self._recorder.snapshot())
+            raw_window = sum(s.duration for s in self._recorder.snapshot())
+        measured_edge = max(0.0, raw_window - LIVE_MARGIN)
+        live_edge = self._live_clock.update(measured_edge, now) or 0.0
+
         if self._is_casting and self.cast_manager.is_active():
-            pos = self.cast_manager.current_time() or 0.0
+            raw = self.cast_manager.current_time()
+            advancing = not self.cast_manager.is_paused()
+            # cast status arrives in bursts; project between pushes so the bar glides
+            pos = self._cast_clock.update(raw, now, advancing=advancing) or 0.0
         elif self.player is not None:
             pos = self.player.time_s()
         else:
             pos = 0.0
-        return pos, window
+        return pos, live_edge
 
     def _seek_to(self, t: float) -> None:
         _, window = self._target_position_length()
@@ -637,8 +696,11 @@ class MainWindow(QMainWindow):
         self._seek_to(pos + delta)
 
     def _seek_live(self) -> None:
-        _, window = self._target_position_length()
-        self._seek_to(max(0.0, window - 2.0))
+        # live_edge already sits LIVE_MARGIN back from the newest content, so
+        # there's buffered runway ahead and playback resumes immediately.
+        _, live_edge = self._target_position_length()
+        self._seek_acc.take()  # cancel any pending stacked step
+        self._seek_to(live_edge)
 
     def _pause_toggle(self) -> None:
         if self._is_casting and self.cast_manager.is_active():
@@ -715,14 +777,35 @@ class MainWindow(QMainWindow):
             self._toolbar.hide()
             self.statusBar().hide()
             self.showFullScreen()
+            # transport follows you into fullscreen as a draggable overlay
+            self._overlay.adopt(self.timeline_widget, self.controls_widget)
+            self._overlay.adjustSize()
+            self._place_overlay()
+            self._overlay.show()
+            self._overlay.raise_()
             self._is_fullscreen = True
         else:
+            self._overlay_pos = self._overlay.pos()
+            self._overlay.hide()
+            # put the transport back into the right pane, below the video
+            self._right_layout.addWidget(self.timeline_widget)
+            self._right_layout.addWidget(self.controls_widget)
             for w in self._chrome:
                 w.show()
             self._toolbar.show()
             self.statusBar().show()
             self.showNormal()
             self._is_fullscreen = False
+
+    def _place_overlay(self) -> None:
+        """Restore the remembered overlay position, else centre it near the bottom."""
+        if self._overlay_pos is not None:
+            self._overlay.move(self._overlay_pos)
+            return
+        screen = self.screen().geometry() if self.screen() else self.geometry()
+        x = screen.x() + (screen.width() - self._overlay.width()) // 2
+        y = screen.y() + screen.height() - self._overlay.height() - 60
+        self._overlay.move(max(screen.x(), x), max(screen.y(), y))
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key_Escape and self._is_fullscreen:
@@ -840,6 +923,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._keep_awake.off()
+        for w in (self._overlay, self._hover_preview):
+            try:
+                w.hide()
+            except Exception:
+                pass
         for closer in (self._teardown_stream, self.proxy.stop, self.cast_manager.shutdown):
             try:
                 closer()
