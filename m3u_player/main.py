@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
+    QItemSelectionModel,
     QModelIndex,
     Qt,
     QThread,
@@ -937,10 +938,24 @@ class MainWindow(QMainWindow):
         self.volume.setValue(max(0, min(100, self.volume.value() + delta)))
 
     def _focus_channels(self) -> None:
-        """Move into the channel list, selecting the first row if nothing is."""
+        """Move into the channel list, landing on the first row if nothing is
+        selected yet.
+
+        After a group change the view keeps a *current* index without any
+        selection, so checking ``isValid()`` alone isn't enough — we'd skip
+        selecting and land with no visible highlight. Select explicitly.
+        """
+        if not self.channel_model.rowCount():
+            return
         self.channel_view.setFocus()
-        if not self.channel_view.currentIndex().isValid() and self.channel_model.rowCount():
-            self.channel_view.setCurrentIndex(self.channel_model.index(0))
+        selection = self.channel_view.selectionModel()
+        index = self.channel_view.currentIndex()
+        if not index.isValid() or selection is None or not selection.hasSelection():
+            index = self.channel_model.index(0)
+        self.channel_view.setCurrentIndex(index)
+        if selection is not None:
+            selection.select(index, QItemSelectionModel.ClearAndSelect)
+        self.channel_view.scrollTo(index)
 
     def eventFilter(self, obj, event):
         """Keys while browsing the panels.
