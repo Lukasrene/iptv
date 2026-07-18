@@ -11,7 +11,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QPalette
+from PySide6.QtGui import QAction, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
-    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -43,7 +42,13 @@ from m3u_player.proxy import HlsProxy
 from m3u_player.recorder import Recorder
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
-from m3u_player.transport import clamp_seek, hover_label
+from m3u_player.thumbnails import Thumbnailer
+from m3u_player.transport import (
+    SeekAccumulator,
+    clamp_seek,
+    hover_label,
+    signed_delta_label,
+)
 
 FAVORITES_LABEL = "★ Favorites"
 
@@ -223,37 +228,73 @@ class VideoFrame(QWidget):
 
 class Timeline(QSlider):
     """DVR scrubber. Range is 0..1000 (a fraction of the buffered window). Emits
-    ``seekRequested(fraction)`` on click/drag, and shows an on-hover tooltip of
-    how far behind live the hovered point is."""
+    ``seekRequested(fraction)`` on click/drag, and ``hovered(fraction, globalPos)``
+    while the pointer moves over it so a scene preview can follow the cursor."""
 
     seekRequested = Signal(float)
+    hovered = Signal(float, object)
+    hoverExited = Signal()
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self.setRange(0, 1000)
         self.setMouseTracking(True)
         self.setEnabled(False)
-        self._label_fn = None  # callable(fraction)->str
         self.sliderReleased.connect(lambda: self.seekRequested.emit(self.value() / 1000.0))
-
-    def set_label_fn(self, fn) -> None:
-        self._label_fn = fn
 
     def _fraction_at(self, x: float) -> float:
         w = max(1, self.width())
         return min(1.0, max(0.0, x / w))
 
     def mouseMoveEvent(self, event) -> None:
-        if self._label_fn is not None:
-            frac = self._fraction_at(event.position().x())
-            QToolTip.showText(event.globalPosition().toPoint(), self._label_fn(frac), self)
+        frac = self._fraction_at(event.position().x())
+        self.hovered.emit(frac, event.globalPosition().toPoint())
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.hoverExited.emit()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         frac = self._fraction_at(event.position().x())
         self.setValue(int(frac * 1000))
         self.seekRequested.emit(frac)
         super().mousePressEvent(event)
+
+
+class HoverPreview(QWidget):
+    """Floating scene preview (thumbnail + jump time) shown above the timeline
+    while hovering."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+        self._img = QLabel()
+        self._img.setFixedSize(160, 90)
+        self._img.setAlignment(Qt.AlignCenter)
+        self._img.setStyleSheet("background:#000; border-radius:4px; color:#888;")
+        self._txt = QLabel()
+        self._txt.setAlignment(Qt.AlignCenter)
+        self._txt.setStyleSheet("color:white; font-weight:bold;")
+        lay.addWidget(self._img)
+        lay.addWidget(self._txt)
+        self.setStyleSheet("background: rgba(24,24,24,235); border-radius:8px;")
+
+    def show_at(self, global_pos, pixmap, text: str) -> None:
+        if pixmap is not None and not pixmap.isNull():
+            self._img.setPixmap(
+                pixmap.scaled(160, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        else:
+            self._img.setPixmap(QPixmap())
+            self._img.setText("…")
+        self._txt.setText(text)
+        self.adjustSize()
+        self.move(global_pos.x() - self.width() // 2, global_pos.y() - self.height() - 16)
+        self.show()
 
 
 # --------------------------------------------------------------------------- #
@@ -274,8 +315,10 @@ class MainWindow(QMainWindow):
         self._keep_awake = KeepAwake()
         self._cast_workers: list[CastWorker] = []
         self._recorder: Recorder | None = None
+        self._thumbnailer: Thumbnailer | None = None
         self._active_channel: Channel | None = None
         self._is_casting = False
+        self._seek_acc = SeekAccumulator()
 
         self.setWindowTitle("M3U Player")
         self.resize(1100, 700)
@@ -328,8 +371,10 @@ class MainWindow(QMainWindow):
         tlayout = QHBoxLayout(self.timeline_widget)
         tlayout.setContentsMargins(0, 0, 0, 0)
         self.timeline = Timeline()
-        self.timeline.set_label_fn(self._timeline_hover_label)
         self.timeline.seekRequested.connect(self._on_timeline_seek)
+        self.timeline.hovered.connect(self._on_timeline_hover)
+        self.timeline.hoverExited.connect(self._on_timeline_hover_exit)
+        self._hover_preview = HoverPreview(self)
         self.behind_live_label = QLabel("")
         self.behind_live_label.setMinimumWidth(120)
         self.behind_live_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -342,12 +387,12 @@ class MainWindow(QMainWindow):
         controls.setContentsMargins(0, 0, 0, 0)
         live_btn = QPushButton("⏮ Live")
         live_btn.clicked.connect(self._seek_live)
-        back10_btn = QPushButton("−10s")
-        back10_btn.clicked.connect(lambda: self._seek_relative(-10))
+        back5_btn = QPushButton("−5s")
+        back5_btn.clicked.connect(lambda: self._seek_step(-5))
         self.pause_btn = QPushButton("⏸")
         self.pause_btn.clicked.connect(self._pause_toggle)
-        fwd10_btn = QPushButton("+10s")
-        fwd10_btn.clicked.connect(lambda: self._seek_relative(10))
+        fwd5_btn = QPushButton("+5s")
+        fwd5_btn.clicked.connect(lambda: self._seek_step(5))
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._on_play_clicked)
         stop_btn = QPushButton("Stop")
@@ -359,7 +404,7 @@ class MainWindow(QMainWindow):
         self.volume.setValue(80)
         self.volume.setMaximumWidth(120)
         self.volume.valueChanged.connect(self._on_volume)
-        for w in (live_btn, back10_btn, self.pause_btn, fwd10_btn, self.play_btn, stop_btn):
+        for w in (live_btn, back5_btn, self.pause_btn, fwd5_btn, self.play_btn, stop_btn):
             controls.addWidget(w)
         controls.addStretch(1)
         controls.addWidget(QLabel("🔊"))
@@ -393,6 +438,12 @@ class MainWindow(QMainWindow):
         self._pos_timer.timeout.connect(self._update_timeline)
         self._pos_timer.start()
         self._window_seconds = 0.0  # current buffered window length
+
+        # debounce that fires one coalesced seek after rapid ±5s presses
+        self._seek_commit_timer = QTimer(self)
+        self._seek_commit_timer.setSingleShot(True)
+        self._seek_commit_timer.setInterval(350)
+        self._seek_commit_timer.timeout.connect(self._commit_seek)
 
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
@@ -511,16 +562,23 @@ class MainWindow(QMainWindow):
         self._recorder.start()
         self.proxy.attach_recorder(self._recorder)
         self.proxy.start()
+        self._thumbnailer = Thumbnailer(dvr_dir / "thumbs", self._recorder)
+        self._thumbnailer.start()
         self._active_channel = channel
         return self.proxy.manifest_url()
 
     def _teardown_stream(self) -> None:
-        if self._recorder is not None:
-            try:
-                self._recorder.stop()
-            except Exception:
-                pass
-            self._recorder = None
+        for stopper in (
+            self._thumbnailer.stop if self._thumbnailer else None,
+            self._recorder.stop if self._recorder else None,
+        ):
+            if stopper is not None:
+                try:
+                    stopper()
+                except Exception:
+                    pass
+        self._thumbnailer = None
+        self._recorder = None
         self._active_channel = None
 
     def _play(self, channel: Channel | None) -> None:
@@ -591,11 +649,40 @@ class MainWindow(QMainWindow):
         elif self.player is not None:
             self.player.pause()
 
-    def _timeline_hover_label(self, fraction: float) -> str:
-        return hover_label(fraction * self._window_seconds, self._window_seconds)
+    def _seek_step(self, delta: float) -> None:
+        # Coalesce rapid presses: stack onto the pending target and fire once.
+        pos, window = self._target_position_length()
+        target = self._seek_acc.add(delta, pos, 0.0, max(0.0, window))
+        self._window_seconds = window
+        if window > 0:
+            self.timeline.setValue(int(min(1.0, target / window) * 1000))
+            self.behind_live_label.setText(hover_label(target, window))
+        self._seek_commit_timer.start()
+
+    def _commit_seek(self) -> None:
+        target = self._seek_acc.take()
+        if target is not None:
+            self._seek_to(target)
 
     def _on_timeline_seek(self, fraction: float) -> None:
         self._seek_to(fraction * self._window_seconds)
+
+    def _on_timeline_hover(self, fraction: float, global_pos) -> None:
+        window = self._window_seconds
+        if window <= 0:
+            return
+        hovered = fraction * window
+        pos, _ = self._target_position_length()
+        text = f"{signed_delta_label(hovered, pos)}   ({hover_label(hovered, window)})"
+        pixmap = None
+        if self._thumbnailer is not None:
+            path = self._thumbnailer.thumbnail_for_offset(hovered)
+            if path:
+                pixmap = QPixmap(path)
+        self._hover_preview.show_at(global_pos, pixmap, text)
+
+    def _on_timeline_hover_exit(self) -> None:
+        self._hover_preview.hide()
 
     def _update_timeline(self) -> None:
         active = self._recorder is not None
@@ -605,9 +692,12 @@ class MainWindow(QMainWindow):
             return
         pos, window = self._target_position_length()
         self._window_seconds = window
-        if window > 0 and not self.timeline.isSliderDown():
+        # don't fight an active drag or a pending coalesced seek
+        if window > 0 and not self.timeline.isSliderDown() and not self._seek_acc.pending:
             self.timeline.setValue(int(min(1.0, pos / window) * 1000))
-        self.behind_live_label.setText(hover_label(pos, window) if window > 0 else "buffering…")
+            self.behind_live_label.setText(hover_label(pos, window))
+        elif window <= 0:
+            self.behind_live_label.setText("buffering…")
         paused = (
             self.cast_manager.is_paused()
             if (self._is_casting and self.cast_manager.is_active())

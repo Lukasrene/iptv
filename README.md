@@ -56,10 +56,12 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
   **moves to the TV** (the Mac stops playing and the TV streams it directly). Use
   **Cast → Stop casting** to stop, or **Rescan** if your device isn't listed yet.
 - **Pause / rewind (DVR)** — from the moment you start a channel, the app records
-  a rolling **1-hour** buffer. Use the timeline to scrub back (hover shows how far
-  behind live a click lands), **−10s / +10s** to step, **⏸** to pause, and
-  **⏮ Live** to jump back to the live edge. Nothing recorded is lost while you
-  jump around. **Works while casting too** — the same controls drive the TV.
+  a rolling **1-hour** buffer. Use the timeline to scrub back, **−5s / +5s** to
+  step (rapid presses stack: −5, −10, −15…), **⏸** to pause, and **⏮ Live** to
+  jump back to the live edge. Hovering the timeline shows a **scene thumbnail**
+  plus how far you'd jump (and how far behind live it is). Nothing recorded is
+  lost while you jump around. **Works while casting too** — the same controls
+  drive the TV, and the previews come from the buffer so they work there as well.
 - **Refresh** (toolbar) re-fetches a URL playlist to pick up new channels and
   refreshed access tokens.
 
