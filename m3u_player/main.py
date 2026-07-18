@@ -367,6 +367,9 @@ class MainWindow(QMainWindow):
         self._active_channel: Channel | None = None
         self._is_casting = False
         self._seek_acc = SeekAccumulator()
+        self._play_mode = "direct"  # "direct" = raw live stream, "dvr" = relay
+        self._pending_dvr_seek: float | None = None
+        self._pause_after_switch = False
         self._live_clock = SmoothedClock()
         self._cast_clock = SmoothedClock(resync_threshold=4.0)
         self._overlay_pos = None  # remembered fullscreen control position
@@ -640,8 +643,15 @@ class MainWindow(QMainWindow):
         if channel is None or self.player is None:
             return
         try:
-            url = self._ensure_stream(channel)
-            self.player.play(url)
+            # Get a picture up first: waiting for the DVR's first segments cost
+            # ~9s before any video. Start playback, *then* spin up the recorder
+            # in the background so it doesn't compete during the initial
+            # connect. We only switch onto the DVR relay when you rewind.
+            self.player.play(channel.url)
+            self._ensure_stream(channel)
+            self._play_mode = "direct"
+            self._pending_dvr_seek = None
+            self._pause_after_switch = False
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
@@ -667,6 +677,13 @@ class MainWindow(QMainWindow):
             self.player.set_volume(value)
 
     # ---- DVR transport (acts on local VLC, or the Chromecast when casting) --- #
+    def _safe_live(self) -> float:
+        """Furthest actually-playable position in the DVR buffer (no smoothing)."""
+        snap = self._recorder.snapshot() if self._recorder is not None else []
+        raw_window = sum(s.duration for s in snap)
+        margin = max(4.0, 1.2 * snap[-1].duration) if snap else LIVE_MARGIN
+        return max(0.0, raw_window - margin)
+
     def _stream_extents(self) -> tuple[float, float, float]:
         """Return (raw_window, safe_live, display_live) in seconds.
 
@@ -683,11 +700,7 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         snap = self._recorder.snapshot() if self._recorder is not None else []
         raw_window = sum(s.duration for s in snap)
-        # A player needs a little more than one segment of lookahead before it
-        # resumes, so scale the margin to the actual segment length. With locally
-        # re-segmented short segments this lands only a few seconds behind live.
-        margin = max(4.0, 1.2 * snap[-1].duration) if snap else LIVE_MARGIN
-        safe_live = max(0.0, raw_window - margin)
+        safe_live = self._safe_live()
         display_live = self._live_clock.update(safe_live, now) or 0.0
         return raw_window, safe_live, display_live
 
@@ -698,9 +711,28 @@ class MainWindow(QMainWindow):
             advancing = not self.cast_manager.is_paused()
             # cast status arrives in bursts; project between pushes so the bar glides
             return self._cast_clock.update(raw, now, advancing=advancing) or 0.0
+        if self._play_mode == "direct":
+            return self._safe_live()  # watching the raw live stream
         if self.player is not None:
             return self.player.time_s()
         return 0.0
+
+    def _switch_to_dvr(self, target: float) -> bool:
+        """Move local playback onto the DVR relay so it can seek.
+
+        Returns False if the buffer has not built up enough yet.
+        """
+        if self.player is None or self._recorder is None:
+            return False
+        safe_live = self._safe_live()
+        if safe_live <= 0:
+            self.statusBar().showMessage("Buffering — rewind available in a moment")
+            return False
+        if self._play_mode != "dvr":
+            self.player.play(self.proxy.manifest_url())
+            self._play_mode = "dvr"
+        self._pending_dvr_seek = clamp_seek(target, 0.0, safe_live)
+        return True
 
     def _target_position_length(self) -> tuple[float, float]:
         """(position, display live edge) — for the readout only."""
@@ -710,20 +742,33 @@ class MainWindow(QMainWindow):
     def _seek_to(self, t: float) -> None:
         # Clamp to what is actually downloaded — never the projected edge, or the
         # player waits for content that does not exist yet.
-        _, safe_live, _ = self._stream_extents()
+        safe_live = self._safe_live()
         t = clamp_seek(t, 0.0, safe_live)
         if self._is_casting and self.cast_manager.is_active():
             self.cast_manager.seek(t)
-        elif self.player is not None:
+            return
+        if self._play_mode == "direct":
+            # rewinding for the first time: hop onto the DVR relay at that point
+            self._switch_to_dvr(t)
+            return
+        if self.player is not None:
             self.player.seek_s(t)
 
     def _seek_relative(self, delta: float) -> None:
         self._seek_to(self._current_position() + delta)
 
     def _seek_live(self) -> None:
-        _, safe_live, _ = self._stream_extents()
         self._seek_acc.take()  # cancel any pending stacked step
-        self._seek_to(safe_live)
+        if self._is_casting and self.cast_manager.is_active():
+            self.cast_manager.seek(self._safe_live())
+            return
+        # Locally, going live means going back to the raw stream: genuinely live
+        # and it starts immediately, instead of seeking inside the buffer.
+        if self._active_channel is not None and self.player is not None:
+            self.player.play(self._active_channel.url)
+            self._play_mode = "direct"
+            self._pending_dvr_seek = None
+            self._pause_after_switch = False
 
     def _pause_toggle(self) -> None:
         if self._is_casting and self.cast_manager.is_active():
@@ -731,7 +776,14 @@ class MainWindow(QMainWindow):
                 self.cast_manager.resume()
             else:
                 self.cast_manager.pause()
-        elif self.player is not None:
+            return
+        if self._play_mode == "direct":
+            # Pausing a live stream only works on the DVR copy — hop across at
+            # the live point and pause there so resuming continues from here.
+            if self._switch_to_dvr(self._safe_live()):
+                self._pause_after_switch = True
+            return
+        if self.player is not None:
             self.player.pause()
 
     def _seek_step(self, delta: float) -> None:
@@ -784,6 +836,19 @@ class MainWindow(QMainWindow):
         if not active:
             self.behind_live_label.setText("")
             return
+        # apply a deferred seek once the relay has actually opened
+        if (
+            self._pending_dvr_seek is not None
+            and self._play_mode == "dvr"
+            and self.player is not None
+            and self.player.length_s() > 0
+        ):
+            self.player.seek_s(self._pending_dvr_seek)
+            self._pending_dvr_seek = None
+            if self._pause_after_switch:
+                self.player.pause()
+                self._pause_after_switch = False
+
         _, safe_live, display_live = self._stream_extents()
         pos = self._current_position()
         self._window_seconds = safe_live

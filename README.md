@@ -91,6 +91,13 @@ a player needs a couple of segments of lookahead before playback resumes — wit
 in ~3s. ffmpeg also manages the rolling window, deleting segments as they age
 out.
 
+**How it starts fast.** Selecting a channel plays the **raw stream directly**, so
+video appears in ~2–3s, while the DVR recorder builds the buffer in the
+background. Playback only moves onto the DVR relay the moment you actually
+rewind (or pause), and **Live ⏭** hops straight back to the raw stream — which is
+both genuinely live and instant. Waiting for the buffer before showing any
+picture used to cost ~11.5s per channel change; it's now ~3s.
+
 ### Why URL support matters
 
 Your stream URLs carry your access token in the path
