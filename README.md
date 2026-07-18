@@ -64,6 +64,20 @@ python3 -m venv ~/"Library/Application Support/M3UPlayer/venv"
   drive the TV, and the previews come from the buffer so they work there as well.
 - **In fullscreen** the transport controls stay on screen as a floating overlay
   you can **drag anywhere**; it remembers where you put it.
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `Space` | Play / pause |
+| `←` / `→` | Back / forward 5s (tap repeatedly to stack: −5, −10, −15…) |
+| `↑` / `↓` | Volume up / down |
+| `F` | Toggle fullscreen |
+| `Esc` | Leave fullscreen |
+
+Shortcuts are ignored while you're typing in the search box. If the channel list
+has focus, `↑`/`↓` browse the list as usual — click the video to hand keyboard
+control back to playback (starting a channel does this automatically).
 - **Refresh** (toolbar) re-fetches a URL playlist to pick up new channels and
   refreshed access tokens.
 

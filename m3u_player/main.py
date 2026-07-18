@@ -221,6 +221,9 @@ class VideoFrame(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_NativeWindow, True)
+        # focusable so playback shortcuts reach the window (clicking the video
+        # takes focus away from the channel list, where arrows navigate instead)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(QPalette.Window, QColor("black"))
@@ -443,16 +446,20 @@ class MainWindow(QMainWindow):
         live_btn.setToolTip("Jump forward to the live edge")
         live_btn.clicked.connect(self._seek_live)
         back5_btn = QPushButton("−5s")
+        back5_btn.setToolTip("Back 5 seconds (←)")
         back5_btn.clicked.connect(lambda: self._seek_step(-5))
         self.pause_btn = QPushButton("⏸")
+        self.pause_btn.setToolTip("Play / pause (Space)")
         self.pause_btn.clicked.connect(self._pause_toggle)
         fwd5_btn = QPushButton("+5s")
+        fwd5_btn.setToolTip("Forward 5 seconds (→)")
         fwd5_btn.clicked.connect(lambda: self._seek_step(5))
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._on_play_clicked)
         stop_btn = QPushButton("Stop")
         stop_btn.clicked.connect(self._on_stop_clicked)
         fs_btn = QPushButton("⛶")
+        fs_btn.setToolTip("Toggle fullscreen (F, Esc to leave)")
         fs_btn.clicked.connect(self._toggle_fullscreen)
         self.volume = QSlider(Qt.Horizontal)
         self.volume.setRange(0, 100)
@@ -462,9 +469,15 @@ class MainWindow(QMainWindow):
         for w in (live_btn, back5_btn, self.pause_btn, fwd5_btn, self.play_btn, stop_btn):
             controls.addWidget(w)
         controls.addStretch(1)
+        self.volume.setToolTip("Volume (↑ / ↓)")
         controls.addWidget(QLabel("🔊"))
         controls.addWidget(self.volume)
         controls.addWidget(fs_btn)
+        # Controls must not take keyboard focus, or Space would press a button
+        # and arrows would drag a slider instead of driving playback.
+        for w in (live_btn, back5_btn, self.pause_btn, fwd5_btn, self.play_btn,
+                  stop_btn, fs_btn, self.volume, self.timeline):
+            w.setFocusPolicy(Qt.NoFocus)
         rlayout.addWidget(self.controls_widget)
         splitter.addWidget(right)
 
@@ -652,6 +665,7 @@ class MainWindow(QMainWindow):
             self._play_mode = "direct"
             self._pending_dvr_seek = None
             self._pause_after_switch = False
+            self.video_frame.setFocus()  # shortcuts active straight away
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
@@ -905,11 +919,43 @@ class MainWindow(QMainWindow):
         y = screen.y() + screen.height() - self._overlay.height() - 60
         self._overlay.move(max(screen.x(), x), max(screen.y(), y))
 
+    # ---- keyboard shortcuts -------------------------------------------- #
+    VOLUME_STEP = 5
+    SEEK_STEP = 5
+
+    def _nudge_volume(self, delta: int) -> None:
+        self.volume.setValue(max(0, min(100, self.volume.value() + delta)))
+
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key_Escape and self._is_fullscreen:
-            self._toggle_fullscreen()
-        else:
+        # Never hijack typing — the search box keeps every keystroke.
+        if isinstance(QApplication.focusWidget(), QLineEdit):
             super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        if key == Qt.Key_Escape:
+            if self._is_fullscreen:
+                self._toggle_fullscreen()
+                return
+        elif key == Qt.Key_F:
+            self._toggle_fullscreen()
+            return
+        elif key == Qt.Key_Space:
+            self._pause_toggle()
+            return
+        elif key == Qt.Key_Left:
+            self._seek_step(-self.SEEK_STEP)
+            return
+        elif key == Qt.Key_Right:
+            self._seek_step(self.SEEK_STEP)
+            return
+        elif key == Qt.Key_Up:
+            self._nudge_volume(self.VOLUME_STEP)
+            return
+        elif key == Qt.Key_Down:
+            self._nudge_volume(-self.VOLUME_STEP)
+            return
+        super().keyPressEvent(event)
 
     # ---- context menu: favorites + cast -------------------------------- #
     def _on_channel_menu(self, pos) -> None:
