@@ -64,10 +64,10 @@ FAVORITES_LABEL = "★ Favorites"
 # stopping. Raise it if re-arms become audible.
 REARM_MARGIN = 12.0
 
-# How much buffer must exist before playback hands off from the raw provider
-# stream to the local relay. Enough to play from, small enough that the handoff
-# happens well before the raw connection becomes unreliable.
-HANDOFF_MIN_BUFFER = 12.0
+# Enough buffer that proxy.LIVE_START_OFFSET can actually be honoured — the
+# cushion is fixed when playback starts, so handing off too early locks in a
+# cushion too small to absorb upstream jitter.
+HANDOFF_MIN_BUFFER = 25.0
 
 
 class KeepAwake:

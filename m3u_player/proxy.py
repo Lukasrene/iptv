@@ -67,21 +67,30 @@ LIVE_WINDOW_SEGMENTS = 90
 # Segments withheld from the end of the live manifest, so the player's idea of
 # "live" sits behind what we have actually downloaded.
 #
-# This is the buffering cushion. The upstream feed is not smooth — segment
-# arrival was measured gapping by 5s, and the recorder running at ~0.5x realtime
-# for stretches. A player sitting at the true live edge starves the moment that
-# happens, which is what breaks picture and sound up. Holding segments back
-# means a stall upstream is invisible until the reserve is used up.
-#
 # Measured at 0: holding segments back made things *worse* — 4 dark periods
-# totalling 104s over 4 minutes, against none with no hold-back. A cushion only
-# absorbs jitter if the buffer fills at least as fast as it drains, and here the
-# recorder was measured capturing ~0.5x realtime. Withholding content from a
-# player that is already starving just starves it sooner.
-#
-# Kept as a knob because "add more buffering" is the obvious response to
-# break-up, and on this setup it is the wrong one. Fix the fill rate instead.
+# totalling 104s over 4 minutes, against none without it. Withholding segments
+# gives the player no runway, because it cannot play what is not listed; it only
+# adds latency. Use LIVE_START_OFFSET below for an actual cushion.
 LIVE_HOLD_BACK_SEGMENTS = 0
+
+
+# How far behind the live edge playback starts, in seconds.
+#
+# This is the starvation cushion, and it is expressed as a *start offset* rather
+# than by trimming the playlist. Withholding segments (LIVE_HOLD_BACK_SEGMENTS
+# above) does not give the player any runway, because it cannot play what is not
+# listed — measured making things worse. Telling the player to begin further
+# back leaves every segment available and gives it real content to chew through.
+#
+# The recorder keeps up fine (60s of content buffered per 45s of wall clock, and
+# #EXTINF durations match the segments exactly). The problem is purely that a
+# player starting at the live edge has no margin, so ordinary upstream jitter
+# starves it — and Qt's HLS demuxer recovers from starvation very badly, going
+# dark for tens of seconds rather than hiccuping.
+# 18s absorbs the measured 5.4s worst-case jitter with ~3x margin. Larger would
+# be safer still, but the cushion is fixed at hand-off time, so a bigger one
+# means longer on the raw stream first (which is what breaks up).
+LIVE_START_OFFSET = 18.0
 
 
 def build_dvr_manifest(
@@ -89,6 +98,7 @@ def build_dvr_manifest(
     local_base: str,
     window: int = LIVE_WINDOW_SEGMENTS,
     hold_back: int = LIVE_HOLD_BACK_SEGMENTS,
+    start_offset: float = LIVE_START_OFFSET,
 ) -> str:
     """Sliding-window *live* manifest — ``/live.m3u8``, for the Chromecast and
     for local playback while following live.
@@ -110,7 +120,15 @@ def build_dvr_manifest(
         segments = segments[:-hold_back]
     if window > 0:
         segments = segments[-window:]
-    return "\n".join(_manifest_lines(segments, local_base)) + "\n"
+    lines = _manifest_lines(segments, local_base)
+    if start_offset > 0 and segments:
+        # Negative offset = that many seconds back from the live edge. Only
+        # meaningful once the buffer is deep enough to honour it.
+        available = sum(s.duration for s in segments)
+        back = min(start_offset, max(0.0, available - 2 * segments[-1].duration))
+        if back > 0:
+            lines.insert(4, f"#EXT-X-START:TIME-OFFSET=-{back:.3f},PRECISE=YES")
+    return "\n".join(lines) + "\n"
 
 
 def build_vod_manifest(segments: list[RecordedSeg], local_base: str) -> str:
