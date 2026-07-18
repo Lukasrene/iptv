@@ -86,14 +86,14 @@ MANY = [RecordedSeg(700 + n, f"/tmp/{n}.ts", 2.0) for n in range(50)]
 
 
 def test_live_manifest_lists_only_the_newest_segments():
-    out = build_dvr_manifest(MANY, BASE, window=20)
+    out = build_dvr_manifest(MANY, BASE, window=20, hold_back=0)
     assert out.count("#EXTINF:") == 20
     assert f"{BASE}/seg/749.ts" in out       # newest present
     assert f"{BASE}/seg/700.ts" not in out   # oldest dropped
 
 
 def test_live_manifest_media_sequence_follows_the_window():
-    out = build_dvr_manifest(MANY, BASE, window=20)
+    out = build_dvr_manifest(MANY, BASE, window=20, hold_back=0)
     assert "#EXT-X-MEDIA-SEQUENCE:730" in out
 
 
@@ -107,3 +107,25 @@ def test_vod_manifest_still_lists_the_whole_buffer():
     out = build_vod_manifest(MANY, BASE)
     assert out.count("#EXTINF:") == 50
     assert f"{BASE}/seg/700.ts" in out
+
+
+# --------------------------------------------------------------------------- #
+# Buffering cushion: the live manifest lags what we have actually downloaded,
+# so an upstream stall is absorbed instead of starving the player.
+# --------------------------------------------------------------------------- #
+def test_live_manifest_holds_newest_segments_in_reserve():
+    out = build_dvr_manifest(MANY, BASE, window=90, hold_back=6)
+    assert f"{BASE}/seg/749.ts" not in out   # newest 6 withheld
+    assert f"{BASE}/seg/743.ts" in out       # newest offered
+
+
+def test_hold_back_does_not_empty_a_small_buffer():
+    """While the buffer is still filling there must still be something to play."""
+    out = build_dvr_manifest(SEGS, BASE, hold_back=6)
+    assert out.count("#EXTINF:") == 3
+
+
+def test_vod_snapshot_is_not_held_back():
+    """Rewinding should reach everything recorded, cushion or not."""
+    out = build_vod_manifest(MANY, BASE)
+    assert f"{BASE}/seg/749.ts" in out

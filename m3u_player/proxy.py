@@ -64,8 +64,31 @@ def _manifest_lines(segments: list[RecordedSeg], local_base: str) -> list[str]:
 LIVE_WINDOW_SEGMENTS = 90
 
 
+# Segments withheld from the end of the live manifest, so the player's idea of
+# "live" sits behind what we have actually downloaded.
+#
+# This is the buffering cushion. The upstream feed is not smooth — segment
+# arrival was measured gapping by 5s, and the recorder running at ~0.5x realtime
+# for stretches. A player sitting at the true live edge starves the moment that
+# happens, which is what breaks picture and sound up. Holding segments back
+# means a stall upstream is invisible until the reserve is used up.
+#
+# Measured at 0: holding segments back made things *worse* — 4 dark periods
+# totalling 104s over 4 minutes, against none with no hold-back. A cushion only
+# absorbs jitter if the buffer fills at least as fast as it drains, and here the
+# recorder was measured capturing ~0.5x realtime. Withholding content from a
+# player that is already starving just starves it sooner.
+#
+# Kept as a knob because "add more buffering" is the obvious response to
+# break-up, and on this setup it is the wrong one. Fix the fill rate instead.
+LIVE_HOLD_BACK_SEGMENTS = 0
+
+
 def build_dvr_manifest(
-    segments: list[RecordedSeg], local_base: str, window: int = LIVE_WINDOW_SEGMENTS
+    segments: list[RecordedSeg],
+    local_base: str,
+    window: int = LIVE_WINDOW_SEGMENTS,
+    hold_back: int = LIVE_HOLD_BACK_SEGMENTS,
 ) -> str:
     """Sliding-window *live* manifest — ``/live.m3u8``, for the Chromecast and
     for local playback while following live.
@@ -81,6 +104,10 @@ def build_dvr_manifest(
     the entire history before showing anything. Seeking further back is what
     ``/dvr.m3u8`` is for.
     """
+    # Hold back the newest segments as reserve — but never starve the client of
+    # a playlist entirely while the buffer is still filling.
+    if hold_back > 0 and len(segments) > hold_back + 1:
+        segments = segments[:-hold_back]
     if window > 0:
         segments = segments[-window:]
     return "\n".join(_manifest_lines(segments, local_base)) + "\n"
