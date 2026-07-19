@@ -92,10 +92,22 @@ relay makes rewinding instant anyway. `Live ⏭` seeks to the buffer's live edge
 rather than reopening the raw stream.
 
 **Why the recorder self-heals.** The upstream connection drops for reasons
-outside the app (VPN reconnect, provider reset). `restart_if_dead()` relaunches
-ffmpeg; `append_list` means the buffer and its media sequence survive. ffmpeg's
+outside the app (VPN reconnect, provider reset — measured 19 drops in one
+68-minute evening session). `restart_if_dead()` relaunches ffmpeg;
+`append_list` means the buffer and its media sequence survive. ffmpeg's
 stderr is captured (`last_error()`) — it used to go to `/dev/null`, which made a
 dead recorder indistinguishable from a slow one.
+
+**Why a relaunch passes `-output_ts_offset`.** A fresh ffmpeg rebases its
+output PTS to ~0, and appending that to the existing playlist puts a backward
+DTS jump mid-stream. Qt's demuxer does not ride that out: it abandons the rest
+of the buffer and fires EndOfMedia — playback leaps to the live edge, starves,
+and visibly breaks up/reloads. An `#EXT-X-DISCONTINUITY` tag does *not* help
+(measured: same abort with the tag present). Relaunching with
+`-output_ts_offset <buffer end>` keeps the timeline monotonic, and playback
+rides straight through a restart. Qt also survives a 30s upstream stall on the
+open live playlist unaided (position holds, then resumes), so no extra
+recovery logic is needed on the player side.
 
 **Why playback starts on the raw stream.** Waiting for the DVR buffer's first
 segments cost ~11.5s before any picture. `_play()` now plays `channel.url`

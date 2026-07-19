@@ -131,7 +131,7 @@ class Recorder:
         self._cache: list[RecordedSeg] | None = None
         self._cache_stamp = -1
 
-    def start(self) -> None:
+    def start(self, ts_offset: float = 0.0) -> None:
         if self._proc is not None:
             return
         ffmpeg = ffmpeg_exe()
@@ -141,6 +141,16 @@ class Recorder:
             "-fflags", "+genpts",
             "-i", str(self._src),
             "-c", "copy",
+        ]
+        if ts_offset > 0:
+            # A fresh ffmpeg rebases its output PTS to ~0. Appending that to an
+            # existing playlist puts a backward DTS jump mid-stream, which Qt's
+            # demuxer does not ride out: it abandons the rest of the buffer and
+            # fires EndOfMedia (measured — even with an #EXT-X-DISCONTINUITY
+            # tag). Shifting the relaunch's output to continue where the buffer
+            # ends keeps the timeline monotonic, and playback simply plays on.
+            cmd += ["-output_ts_offset", f"{ts_offset:.3f}"]
+        cmd += [
             "-f", "hls",
             "-hls_time", str(self._segment_seconds),
             "-hls_list_size", str(self._list_size),
@@ -183,11 +193,12 @@ class Recorder:
 
         ``append_list`` means the relaunched ffmpeg continues the existing index
         rather than truncating it, so the buffer and its media sequence survive.
+        The output timestamps must continue as well — see ``start``.
         """
         if self._proc is None or self.is_alive():
             return False
         self._proc = None
-        self.start()
+        self.start(ts_offset=self.extent()[1])
         return True
 
     def snapshot(self) -> list[RecordedSeg]:

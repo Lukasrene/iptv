@@ -114,3 +114,78 @@ def test_snapshot_reparses_only_when_the_index_changes(tmp_path):
         assert len(calls) == 2
     finally:
         R.parse_hls_index = real
+
+
+# --------------------------------------------------------------------------- #
+# Restart timestamp continuity.
+#
+# A relaunched ffmpeg starts its output PTS back near zero while append_list
+# keeps extending the same playlist. The player then sees DTS jump backwards
+# mid-stream and aborts the rest of the buffer (measured: Qt fires EndOfMedia
+# and leaps to the live edge — the "breaking up and reloading" symptom). The
+# relaunch must carry -output_ts_offset so appended segments continue the
+# timeline monotonically.
+# --------------------------------------------------------------------------- #
+
+
+class _DeadProc:
+    stderr = None
+
+    def poll(self):
+        return 1
+
+
+def test_first_start_has_no_timestamp_offset(tmp_path, monkeypatch):
+    import m3u_player.recorder as R
+    cmds = []
+    monkeypatch.setattr(R, "ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        R.subprocess, "Popen", lambda cmd, **kw: (cmds.append(cmd), _DeadProc())[1]
+    )
+    rec = R.Recorder("http://example.com/USER/PASS/1.ts", tmp_path)
+    rec.start()
+    assert "-output_ts_offset" not in cmds[0]
+
+
+def test_relaunch_continues_the_output_timeline(tmp_path, monkeypatch):
+    import m3u_player.recorder as R
+    rec = R.Recorder("http://example.com/USER/PASS/1.ts", tmp_path)
+    (tmp_path / "index.m3u8").write_text(
+        "#EXTM3U\n#EXTINF:5.000,\nseg_000000.ts\n#EXTINF:1.500,\nseg_000001.ts\n"
+    )
+    cmds = []
+    monkeypatch.setattr(R, "ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        R.subprocess, "Popen", lambda cmd, **kw: (cmds.append(cmd), _DeadProc())[1]
+    )
+    rec._proc = _DeadProc()
+    assert rec.restart_if_dead()
+    cmd = cmds[0]
+    assert "-output_ts_offset" in cmd
+    offset = float(cmd[cmd.index("-output_ts_offset") + 1])
+    assert offset == 6.5  # everything recorded so far, evictions included
+
+
+def test_relaunch_offset_includes_evicted_duration(tmp_path, monkeypatch):
+    import m3u_player.recorder as R
+    rec = R.Recorder("http://example.com/USER/PASS/1.ts", tmp_path)
+    index = tmp_path / "index.m3u8"
+    index.write_text(
+        "#EXTM3U\n#EXTINF:5.000,\nseg_000000.ts\n#EXTINF:5.000,\nseg_000001.ts\n"
+    )
+    rec.snapshot()
+    # seg 0 ages out of the rolling window before the crash
+    import os, time
+    index.write_text("#EXTM3U\n#EXTINF:5.000,\nseg_000001.ts\n")
+    os.utime(index, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    rec.snapshot()
+    cmds = []
+    monkeypatch.setattr(R, "ffmpeg_exe", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        R.subprocess, "Popen", lambda cmd, **kw: (cmds.append(cmd), _DeadProc())[1]
+    )
+    rec._proc = _DeadProc()
+    assert rec.restart_if_dead()
+    cmd = cmds[0]
+    offset = float(cmd[cmd.index("-output_ts_offset") + 1])
+    assert offset == 10.0  # 5s evicted + 5s still on disk
