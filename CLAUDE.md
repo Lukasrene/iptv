@@ -51,6 +51,14 @@ driving them against the real stream — see "Verification" below.
 - Requests need a **VLC `User-Agent`**, or the provider resets the connection
   (`error 54`). `recorder._UA` is therefore *not* a leftover VLC dependency —
   it is a string the provider demands. Do not "clean it up".
+- The account allows **`max_connections: 1`** (see the panel API). Two streams
+  on the account fight each other: the provider kills one every ~30s ("Stream
+  ends prematurely" in ffmpeg's stderr). This has two consequences. (1) Any
+  headless test that opens the provider **while the app is playing steals the
+  user's stream** — check `pgrep -fl "M3U Player"` before running one. (2) The
+  app's own raw-bootstrap + recorder pair briefly opens two connections per
+  channel start; enforcement racing the handoff is a suspected cause of early
+  recorder deaths.
 - The provider's HLS manifest **302-redirects to an edge host**, and its segment
   URLs are relative with a **session hash** valid only against that host. A
   Chromecast can't follow this, which is why casting goes through our local relay.
@@ -108,6 +116,15 @@ and visibly breaks up/reloads. An `#EXT-X-DISCONTINUITY` tag does *not* help
 rides straight through a restart. Qt also survives a 30s upstream stall on the
 open live playlist unaided (position holds, then resumes), so no extra
 recovery logic is needed on the player side.
+
+**Why live playback snaps forward after a reconnect.** On reconnect the
+provider replays the last ~10-20s it already sent. The relaunch necessarily
+appends that with continuous timestamps (see above), so a viewer following
+live seamlessly *re-watches* it — and drifts that much further behind true
+live on every drop. `ReplaySkip` (transport.py) notes the buffer end at the
+restart; once the buffer has regrown `LIVE_START_OFFSET` past it, `main`
+re-arms `/live.m3u8`, whose start offset then lands beyond the replayed
+stretch — one small forward skip instead of a 20s rerun, and no latency creep.
 
 **Why playback starts on the raw stream.** Waiting for the DVR buffer's first
 segments cost ~11.5s before any picture. `_play()` now plays `channel.url`

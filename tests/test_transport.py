@@ -103,3 +103,90 @@ def test_clock_reset():
     c.update(100, now=0)
     c.reset()
     assert c.update(5, now=99) == 5
+
+
+# --------------------------------------------------------------------------- #
+# Stall detection.
+#
+# From the viewer's POV a freeze frame and buffering look identical. The player
+# reports a position 4x/second; if it stops advancing while playback is
+# supposed to be running, that IS buffering/starvation — surface it, after a
+# grace period so ordinary decode jitter doesn't flicker the label.
+# --------------------------------------------------------------------------- #
+from m3u_player.transport import StallDetector
+
+
+def test_advancing_position_is_not_stalled():
+    d = StallDetector(grace=1.5)
+    assert d.update(1.0, playing=True, now=100.0) is False
+    assert d.update(1.25, playing=True, now=100.25) is False
+
+
+def test_frozen_position_stalls_after_grace():
+    d = StallDetector(grace=1.5)
+    d.update(1.0, playing=True, now=100.0)
+    assert d.update(1.0, playing=True, now=101.0) is False
+    assert d.update(1.0, playing=True, now=101.6) is True
+
+
+def test_recovery_clears_the_stall():
+    d = StallDetector(grace=1.5)
+    d.update(1.0, playing=True, now=100.0)
+    d.update(1.0, playing=True, now=102.0)
+    assert d.update(1.5, playing=True, now=102.25) is False
+
+
+def test_paused_playback_never_stalls():
+    d = StallDetector(grace=1.5)
+    d.update(1.0, playing=True, now=100.0)
+    assert d.update(1.0, playing=False, now=105.0) is False
+    # resuming starts the grace period fresh
+    assert d.update(1.0, playing=True, now=105.25) is False
+    assert d.update(1.0, playing=True, now=107.0) is True
+
+
+# --------------------------------------------------------------------------- #
+# Replay skip after a recorder restart.
+#
+# On reconnect the provider replays the last ~10-20s it already sent. The
+# relaunched ffmpeg appends that with continuous timestamps (deliberately — see
+# Recorder.start), so a viewer following live seamlessly re-watches it and
+# drifts further behind true live on every drop. The cure is to note where the
+# buffer ended at the restart and, once it has regrown a full cushion past that
+# point, snap live playback forward over the replayed stretch.
+# --------------------------------------------------------------------------- #
+from m3u_player.transport import ReplaySkip
+
+
+def test_no_skip_without_a_restart():
+    r = ReplaySkip()
+    assert r.should_skip(buffer_end=100.0, cushion=18.0) is False
+
+
+def test_skip_waits_until_the_buffer_regrows_a_cushion():
+    r = ReplaySkip()
+    r.note_restart(buffer_end=100.0)
+    assert r.should_skip(buffer_end=110.0, cushion=18.0) is False
+    assert r.should_skip(buffer_end=118.0, cushion=18.0) is True
+
+
+def test_skip_fires_once():
+    r = ReplaySkip()
+    r.note_restart(buffer_end=100.0)
+    assert r.should_skip(buffer_end=120.0, cushion=18.0) is True
+    assert r.should_skip(buffer_end=125.0, cushion=18.0) is False
+
+
+def test_cancel_forgets_the_pending_skip():
+    r = ReplaySkip()
+    r.note_restart(buffer_end=100.0)
+    r.cancel()
+    assert r.should_skip(buffer_end=200.0, cushion=18.0) is False
+
+
+def test_back_to_back_restarts_anchor_at_the_newest():
+    r = ReplaySkip()
+    r.note_restart(buffer_end=100.0)
+    r.note_restart(buffer_end=120.0)
+    assert r.should_skip(buffer_end=130.0, cushion=18.0) is False
+    assert r.should_skip(buffer_end=138.0, cushion=18.0) is True

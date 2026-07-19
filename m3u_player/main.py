@@ -42,15 +42,17 @@ from uuid import uuid4
 
 from m3u_player.caster import CastManager
 from m3u_player.playlist import Channel, parse_m3u
-from m3u_player.proxy import HlsProxy
+from m3u_player.proxy import LIVE_START_OFFSET, HlsProxy
 from m3u_player.recorder import Recorder
 from m3u_player.source import load_playlist_text
 from m3u_player.store import Config, default_config_path
 from m3u_player.thumbnails import Thumbnailer
 from m3u_player.transport import (
     LIVE_EPSILON,
+    ReplaySkip,
     SeekAccumulator,
     SmoothedClock,
+    StallDetector,
     clamp_seek,
     hover_label,
     signed_delta_label,
@@ -391,6 +393,8 @@ class MainWindow(QMainWindow):
         self._pause_after_switch = False
         self._live_clock = SmoothedClock()
         self._cast_clock = SmoothedClock(resync_threshold=4.0)
+        self._stall = StallDetector()
+        self._replay_skip = ReplaySkip()
         self._overlay_pos = None  # remembered fullscreen control position
 
         self.setWindowTitle("M3U Player")
@@ -686,6 +690,8 @@ class MainWindow(QMainWindow):
             self._play_mode = "raw"
             self._pending_dvr_seek = None
             self._pause_after_switch = False
+            self._stall.reset()
+            self._replay_skip.cancel()
         except Exception as exc:
             self.statusBar().showMessage("Couldn't play this channel")
             QMessageBox.warning(self, "Playback error", str(exc))
@@ -793,6 +799,7 @@ class MainWindow(QMainWindow):
             self._arm_dvr()
             self._play_mode = "dvr"
         self._pending_dvr_seek = clamp_seek(target, start, safe_live)
+        self._replay_skip.cancel()  # rewound: the replayed stretch is now just history
         return True
 
     def _maybe_handoff_to_dvr(self) -> None:
@@ -903,6 +910,7 @@ class MainWindow(QMainWindow):
             self._pending_dvr_seek = None
             self._pause_after_switch = False
             self._dvr_origin = 0.0
+            self._replay_skip.cancel()  # re-armed at the fresh edge already
 
     def _pause_toggle(self) -> None:
         if self._is_casting and self.cast_manager.is_active():
@@ -998,6 +1006,21 @@ class MainWindow(QMainWindow):
         # relaunch it so the buffer resumes growing instead of freezing
         if self._recorder is not None and self._recorder.restart_if_dead():
             self.statusBar().showMessage("Stream interrupted — reconnecting…", 4000)
+            if self._play_mode == "live" and not self._is_casting:
+                self._replay_skip.note_restart(self._recorder.extent()[1])
+        # …and once the buffer has regrown a cushion past the point of the
+        # drop, snap forward over the ~10-20s the provider replays on
+        # reconnect. Without this the viewer seamlessly re-watches it and
+        # falls that much further behind true live on every drop.
+        if (
+            self._play_mode == "live"
+            and self.player is not None
+            and self._recorder is not None
+            and self._replay_skip.should_skip(
+                self._recorder.extent()[1], LIVE_START_OFFSET
+            )
+        ):
+            self.player.play(self.proxy.live_url())
 
         # bootstrap done? move off the raw provider stream onto the relay
         self._maybe_handoff_to_dvr()
@@ -1005,10 +1028,26 @@ class MainWindow(QMainWindow):
         start, safe_live, display_live = self._stream_extents()
         pos = self._current_position()
         self._window_seconds = safe_live
+        # A starved player is a freeze frame — indistinguishable from broken
+        # playback from the viewer's POV. The engine's reported position stops
+        # advancing in that state (unlike _current_position, which projects the
+        # live edge), so watch it directly and say so.
+        stalled = self._stall.update(
+            self.player.time_s() if self.player is not None else 0.0,
+            playing=(
+                not self._is_casting
+                and self.player is not None
+                and self.player.is_playing()
+            ),
+            now=time.monotonic(),
+        )
         # don't fight an active drag or a pending coalesced seek
         if safe_live > start and not self.timeline.isSliderDown() and not self._seek_acc.pending:
             self.timeline.setValue(int(self._abs_to_fraction(pos) * 1000))
-            self.behind_live_label.setText(self._behind_text(pos, safe_live, display_live))
+            if stalled:
+                self.behind_live_label.setText("buffering…")
+            else:
+                self.behind_live_label.setText(self._behind_text(pos, safe_live, display_live))
         elif safe_live <= start:
             self.behind_live_label.setText("buffering…")
         paused = (
