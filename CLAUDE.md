@@ -53,12 +53,11 @@ driving them against the real stream — see "Verification" below.
   it is a string the provider demands. Do not "clean it up".
 - The account allows **`max_connections: 1`** (see the panel API). Two streams
   on the account fight each other: the provider kills one every ~30s ("Stream
-  ends prematurely" in ffmpeg's stderr). This has two consequences. (1) Any
-  headless test that opens the provider **while the app is playing steals the
-  user's stream** — check `pgrep -fl "M3U Player"` before running one. (2) The
-  app's own raw-bootstrap + recorder pair briefly opens two connections per
-  channel start; enforcement racing the handoff is a suspected cause of early
-  recorder deaths.
+  ends prematurely" in ffmpeg's stderr). Consequences: any headless test that
+  opens the provider **while the app is playing steals the user's stream** —
+  check `pgrep -fl "M3U Player"` before running one — and the app itself must
+  only ever hold one connection (the recorder's), which is why playback runs
+  exclusively off the local relay.
 - The provider's HLS manifest **302-redirects to an edge host**, and its segment
   URLs are relative with a **session hash** valid only against that host. A
   Chromecast can't follow this, which is why casting goes through our local relay.
@@ -91,13 +90,16 @@ the front. Measuring position as an offset into the *current* buffer slid the
 whole timeline under the viewer whenever that happened, so positions are anchored
 on `media_seq` via `Recorder.evicted_seconds()`.
 
-**Why the raw stream is only a bootstrap.** `_play()` starts on `channel.url` for
-a fast first frame (~2s vs several seconds waiting for segments), but hands off
-to the local relay once the buffer can carry it (`_maybe_handoff_to_dvr`). The
-raw connection was measured dying after ~30s while the recorder read the same
-source indefinitely — so it is not a good bet for sustained playback, and the
-relay makes rewinding instant anyway. `Live ⏭` seeks to the buffer's live edge
-rather than reopening the raw stream.
+**Why playback never touches the raw stream.** Playback runs exclusively off
+the local relay (`_maybe_start_from_buffer`). It used to bootstrap on
+`channel.url` for a fast first frame, but with `max_connections: 1` that second
+connection raced the recorder's, and the raw stream also broke up on its own
+(program changes make Qt rebuild its decoders — 367 decode errors over 4
+minutes, vs zero through the remux). Buffer-first start is no longer slow: the
+provider bursts its ~20s backlog on connect, so the first segments land in
+~1.4s and first video follows in ~2.5-3.0s (measured; the raw bootstrap
+managed ~3.4s — and the old ~11.5s figure predates short local segments).
+`Live ⏭` seeks to the buffer's live edge, never `channel.url`.
 
 **Why the recorder self-heals.** The upstream connection drops for reasons
 outside the app (VPN reconnect, provider reset — measured 19 drops in one
@@ -125,13 +127,6 @@ live on every drop. `ReplaySkip` (transport.py) notes the buffer end at the
 restart; once the buffer has regrown `LIVE_START_OFFSET` past it, `main`
 re-arms `/live.m3u8`, whose start offset then lands beyond the replayed
 stretch — one small forward skip instead of a 20s rerun, and no latency creep.
-
-**Why playback starts on the raw stream.** Waiting for the DVR buffer's first
-segments cost ~11.5s before any picture. `_play()` now plays `channel.url`
-directly (`_play_mode == "direct"`) and starts the recorder in the background;
-playback only switches to the relay (`"dvr"`) when the user rewinds/pauses.
-`Live ⏭` switches back to direct. Measured: ~11.5s → ~3.4s to first video.
-Note this opens **two** provider connections per channel (playback + recorder).
 
 **Why the live edge is smoothed.** The buffer grows in segment-sized jumps while
 playback advances continuously, so a naive `buffer_end - position` counts down

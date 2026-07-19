@@ -197,8 +197,13 @@ class HlsProxy:
         playlist is one Qt keeps reloading by itself, so live playback runs
         uninterrupted. It just cannot be seeked — which is what ``/dvr.m3u8`` is
         for, once the viewer rewinds.
+
+        Carries a cache-busting query for the same reason ``dvr_url`` does:
+        re-arming live playback (the replay skip after a reconnect, ``Live ⏭``)
+        hands Qt this URL again, and ``setSource`` with an *unchanged* URL does
+        not reliably reload — the re-arm silently becomes a no-op.
         """
-        return f"{self._local_base}/live.m3u8"
+        return f"{self._local_base}/live.m3u8?t={time.time():.3f}"
 
     def dvr_url(self) -> str:
         """Closed VOD snapshot on the loopback address — for the local player.

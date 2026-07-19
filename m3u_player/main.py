@@ -66,10 +66,13 @@ FAVORITES_LABEL = "★ Favorites"
 # stopping. Raise it if re-arms become audible.
 REARM_MARGIN = 12.0
 
-# Enough buffer that proxy.LIVE_START_OFFSET can actually be honoured — the
-# cushion is fixed when playback starts, so handing off too early locks in a
-# cushion too small to absorb upstream jitter.
-HANDOFF_MIN_BUFFER = 25.0
+# Segments that must exist before pointing the player at the relay. The
+# provider bursts its ~20s backlog on connect, so this many land in ~1.4s and
+# first video follows at ~2.5-3.0s (measured; the raw provider stream managed
+# ~3.4s at best). The live manifest's start offset clamps to what is buffered,
+# and the tail of the burst builds the full cushion within a few seconds of
+# playback starting.
+START_MIN_SEGMENTS = 3
 
 
 class KeepAwake:
@@ -385,10 +388,10 @@ class MainWindow(QMainWindow):
         self._active_channel: Channel | None = None
         self._is_casting = False
         self._seek_acc = SeekAccumulator()
-        # "raw"  = provider stream direct (bootstrap only, first seconds)
-        # "live" = local relay, open-ended manifest, following live
-        # "dvr"  = local relay, VOD snapshot, rewound and seekable
-        self._play_mode = "raw"
+        # "starting" = recorder spinning up, player not armed yet
+        # "live"     = local relay, open-ended manifest, following live
+        # "dvr"      = local relay, VOD snapshot, rewound and seekable
+        self._play_mode = "starting"
         self._pending_dvr_seek: float | None = None
         self._pause_after_switch = False
         self._live_clock = SmoothedClock()
@@ -681,13 +684,20 @@ class MainWindow(QMainWindow):
         if channel is None or self.player is None:
             return
         try:
-            # Get a picture up first: waiting for the DVR's first segments cost
-            # ~9s before any video. Start playback, *then* spin up the recorder
-            # in the background so it doesn't compete during the initial
-            # connect. We only switch onto the DVR relay when you rewind.
-            self.player.play(channel.url)
+            # One provider connection, ever: the account allows a single stream
+            # (max_connections=1), so the old raw-stream bootstrap fought the
+            # recorder for it. The recorder's backlog burst puts the first
+            # segments on disk in ~1.4s, so starting from the relay is as fast
+            # as the raw stream was (~2.5-3.0s to first video, measured) —
+            # _update_timeline arms the player once enough segments exist.
+            #
+            # Stop before swapping recorders: the player would otherwise keep
+            # demuxing the old channel's manifest while the proxy starts
+            # serving the new channel underneath it — measured degrading the
+            # next channel to a stutter until well after the re-arm.
+            self.player.stop()
             self._ensure_stream(channel)
-            self._play_mode = "raw"
+            self._play_mode = "starting"
             self._pending_dvr_seek = None
             self._pause_after_switch = False
             self._stall.reset()
@@ -771,7 +781,7 @@ class MainWindow(QMainWindow):
             advancing = not self.cast_manager.is_paused()
             # cast status arrives in bursts; project between pushes so the bar glides
             return self._cast_clock.update(raw, now, advancing=advancing) or 0.0
-        if self._play_mode in ("raw", "live"):
+        if self._play_mode in ("starting", "live"):
             return self._safe_live()  # following live; not a seekable timeline
         if self.player is not None:
             # player time is relative to the armed snapshot's first segment
@@ -802,39 +812,34 @@ class MainWindow(QMainWindow):
         self._replay_skip.cancel()  # rewound: the replayed stretch is now just history
         return True
 
-    def _maybe_handoff_to_dvr(self) -> None:
-        """Hand off from the raw stream to the local relay once it can carry us.
+    def _maybe_start_from_buffer(self) -> None:
+        """Arm the player once the recorder has produced enough to start from.
 
-        The raw provider stream exists only to get a picture up fast (~1.4s, vs
-        several seconds waiting for the first segments). It is not a good bet for
-        sustained playback: it is a single long-lived connection to the provider,
-        and it was measured dying after ~30s while the recorder — reading the
-        same source through ffmpeg — stayed healthy indefinitely.
+        Playback *only* ever runs off the local relay. It used to bootstrap on
+        the raw provider stream for a fast first picture, but the account allows
+        a single connection (max_connections=1), so that second connection
+        raced the recorder's — the provider kills the older one after a grace
+        period. The raw stream also broke up on its own: its program changes
+        (ad insertion and the like) made Qt rebuild its decoders — measured 367
+        decode errors over 4 minutes, against zero through ffmpeg's remux.
 
-        So once the buffer holds enough to play from, we move onto it at the live
-        edge. The handoff costs one seek (~0.2s), and from then on playback is
-        reading local disk, which also means rewinding is instant.
+        Waiting for the buffer is no longer slow, because the provider bursts
+        its ~20s backlog on connect: the first segments land in ~1.4s and first
+        video follows at ~2.5-3.0s (measured — the raw bootstrap managed ~3.4s).
+
+        The open-ended manifest, not a VOD snapshot — at the live edge a
+        snapshot ends within seconds of the playhead and would need re-arming
+        constantly, and every re-arm is a visible reload.
         """
         if (
-            self._play_mode != "raw"
+            self._play_mode != "starting"
             or self.player is None
             or self._recorder is None
             or self._is_casting
         ):
             return
-        start, safe_live, _ = self._stream_extents()
-        if safe_live - start < HANDOFF_MIN_BUFFER:
+        if len(self._recorder.snapshot()) < START_MIN_SEGMENTS:
             return
-        # Move onto the *remuxed* local segments. This is what stops picture and
-        # audio breaking up: the provider's raw MPEG-TS changes program
-        # frequently (ad insertion and the like) and Qt's backend rebuilds its
-        # decoders each time, which drops the picture. Measured over 4 minutes on
-        # the raw stream: 367 decode errors. Through ffmpeg's `-c copy` remux:
-        # zero.
-        #
-        # The open-ended manifest, not a VOD snapshot — at the live edge a
-        # snapshot ends within seconds of the playhead and would need re-arming
-        # constantly, and every re-arm is a visible reload.
         self.player.play(self.proxy.live_url())
         self._play_mode = "live"
 
@@ -844,8 +849,8 @@ class MainWindow(QMainWindow):
         A VOD manifest is frozen at the newest segment it listed, so playback
         behind live would otherwise simply stop when it reached that point.
         Re-arming costs one seek (~0.2s), which is why this is tolerable at all.
-        If we have already caught up to live, go back to the raw stream instead —
-        that is genuinely live and needs no buffer.
+        If we have already caught up to live, go back to the open-ended live
+        manifest instead — it follows the edge without re-arming.
         """
         if self.player is None or self._recorder is None:
             return
@@ -874,7 +879,7 @@ class MainWindow(QMainWindow):
             # starts at the buffer front
             self.cast_manager.seek(t - start)
             return
-        if self._play_mode in ("raw", "live"):
+        if self._play_mode in ("starting", "live"):
             # rewinding for the first time: hop onto a seekable snapshot
             self._switch_to_dvr(t)
             return
@@ -894,16 +899,11 @@ class MainWindow(QMainWindow):
         if self._is_casting and self.cast_manager.is_active():
             self.cast_manager.seek(self._safe_live() - self._buffer_start())
             return
-        # Going live means seeking to the live edge of the buffer, not reopening
-        # the raw provider stream. The raw stream is only ever a bootstrap for
-        # the first few seconds (see _maybe_handoff_to_dvr) — reopening it here
-        # would drop playback back onto the connection that proved unreliable,
-        # and would throw away the buffer we can rewind into.
-        #
         # Back onto the open-ended relay manifest — the same source live
-        # playback normally uses. Not the raw stream (it breaks up, see
-        # _maybe_handoff_to_dvr) and not the armed snapshot (frozen when built,
-        # so seeking to its end lands short and then re-arms constantly).
+        # playback normally uses. Never the raw provider stream (a second
+        # provider connection fights the recorder's, and it breaks up — see
+        # _maybe_start_from_buffer), and not the armed snapshot (frozen when
+        # built, so seeking to its end lands short and then re-arms constantly).
         if self._recorder is not None and self.player is not None:
             self.player.play(self.proxy.live_url())
             self._play_mode = "live"
@@ -919,7 +919,7 @@ class MainWindow(QMainWindow):
             else:
                 self.cast_manager.pause()
             return
-        if self._play_mode in ("raw", "live"):
+        if self._play_mode in ("starting", "live"):
             # Pausing a live stream only works on the DVR copy — hop across at
             # the live point and pause there so resuming continues from here.
             if self._switch_to_dvr(self._safe_live()):
@@ -979,7 +979,7 @@ class MainWindow(QMainWindow):
             self.behind_live_label.setText("")
             return
         # apply a deferred seek once the relay has actually opened and reports a
-        # real duration (a VOD manifest is seekable, the raw live stream is not)
+        # real duration (a VOD manifest is seekable, an open live playlist is not)
         if (
             self._pending_dvr_seek is not None
             and self._play_mode == "dvr"
@@ -1022,8 +1022,8 @@ class MainWindow(QMainWindow):
         ):
             self.player.play(self.proxy.live_url())
 
-        # bootstrap done? move off the raw provider stream onto the relay
-        self._maybe_handoff_to_dvr()
+        # channel just started? arm the player once the buffer can carry it
+        self._maybe_start_from_buffer()
 
         start, safe_live, display_live = self._stream_extents()
         pos = self._current_position()
